@@ -260,6 +260,10 @@ pub fn deinit(self: *Self, allocator: std.mem.Allocator) void {
     secureDeinit(self.impl.wl_callback, c.wl_callback_destroy);
     secureDeinit(self.impl.wl_shm_pool, c.wl_shm_pool_destroy);
     secureDeinit(self.impl.wl_keyboard, c.wl_keyboard_destroy);
+    secureDeinit(self.impl.wl_pointer, c.wl_pointer_destroy);
+
+    secureDeinit(self.impl.wp_cursor_shape_manager_v1, c.wp_cursor_shape_manager_v1_destroy);
+    secureDeinit(self.impl.wp_cursor_shape_device_v1, c.wp_cursor_shape_device_v1_destroy);
 
     secureDeinit(self.impl.xkb_keymap, c.xkb_keymap_unref);
     secureDeinit(self.impl.xkb_state, c.xkb_state_unref);
