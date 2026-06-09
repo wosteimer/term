@@ -1,7 +1,6 @@
 const std = @import("std");
 
 const Size = @import("common.zig").Size;
-const Rect = @import("common.zig").Rect;
 const Shape = @import("common.zig").Shape;
 const Button = @import("common.zig").Button;
 const Modifiers = @import("common.zig").Modifiers;
@@ -151,13 +150,6 @@ pub fn textInputEnable(self: *Self) void {
 
 pub fn textInputDisable(self: *Self) void {
     _ = self;
-    log.err("Not Implemented", .{});
-    unreachable;
-}
-
-pub fn textInputSetRect(self: *Self, rect: Rect) void {
-    _ = self;
-    _ = rect;
     log.err("Not Implemented", .{});
     unreachable;
 }

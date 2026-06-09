@@ -2,7 +2,6 @@ const std = @import("std");
 const c = @import("c");
 
 const Size = @import("common.zig").Size;
-const Rect = @import("common.zig").Rect;
 const Shape = @import("common.zig").Shape;
 const Button = @import("common.zig").Button;
 const Key = @import("common.zig").Key;
@@ -440,13 +439,6 @@ pub fn textInputEnable(self: *Self) void {
 
 pub fn textInputDisable(self: *Self) void {
     self.impl.text_input_enabled = false;
-}
-
-pub fn textInputSetRect(self: *Self, rect: Rect) void {
-    _ = self;
-    _ = rect;
-    log.err("Not Implemented", .{});
-    unreachable;
 }
 
 fn wlRegistryGlobal(

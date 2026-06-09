@@ -98,8 +98,6 @@ pub const Button = enum(u32) {
 
 pub const Size = struct { width: u32, height: u32 };
 
-pub const Rect = struct { x: i32, y: i32, width: u32, height: u32 };
-
 pub const Event = union(enum) {
     pub const WindowResized = struct { width: u32, height: u32 };
 
