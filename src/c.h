@@ -4,4 +4,3 @@
 #include <xdg-shell-client.h>
 #include <xkbcommon/xkbcommon-compose.h>
 #include <xkbcommon/xkbcommon.h>
-#include <zwp-text-input-unstable-v3-client.h>

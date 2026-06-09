@@ -1,38 +1,26 @@
 const std = @import("std");
-const c = @import("c");
 
 const Size = @import("common.zig").Size;
 const Rect = @import("common.zig").Rect;
 const Shape = @import("common.zig").Shape;
 const Button = @import("common.zig").Button;
+const Modifiers = @import("common.zig").Modifiers;
+const Key = @import("common.zig").Key;
 const Event = @import("common.zig").Event;
 
-const log = std.log.scoped(.wayland);
+const log = std.log.scoped(.x11);
 
 const Self = @This();
 
-const wl_registry_listener = c.wl_registry_listener{
-    .global = wlRegistryGlobal,
-    .global_remove = wlRegistryGlobalRemove,
-};
-
-wl_display: ?*c.wl_display,
-wl_registry: ?*c.wl_registry,
-
-pub fn init() Self {
-    const wl_display = c.wl_display_connect(null);
-    const wl_registry = c.wl_display_get_registry(wl_display);
-    _ = c.wl_registry_add_listener(wl_registry, &wl_registry_listener, null);
-    _ = c.wl_display_roundtrip(wl_display);
-    return .{
-        .wl_display = wl_display,
-        .wl_registry = wl_registry,
-    };
+pub fn init() !Self {
+    log.err("Not Implemented", .{});
+    unreachable;
 }
 
 pub fn deinit(self: *Self) void {
-    c.wl_registry_destroy(self.wl_registry);
-    c.wl_display_disconnect(self.wl_display);
+    _ = self;
+    log.err("Not Implemented", .{});
+    unreachable;
 }
 
 pub fn present(self: *Self) void {
@@ -54,9 +42,14 @@ pub fn setTitle(self: *Self, title: []const u8) void {
     unreachable;
 }
 
-pub fn setFullscreen(self: *Self, is_fullscreen: bool) void {
+pub fn setFullscreen(self: *Self) void {
     _ = self;
-    _ = is_fullscreen;
+    log.err("Not Implemented", .{});
+    unreachable;
+}
+
+pub fn unsetFullscreen(self: *Self) void {
+    _ = self;
     log.err("Not Implemented", .{});
     unreachable;
 }
@@ -123,13 +116,6 @@ pub fn pollEvent(self: *Self) ?Event {
     unreachable;
 }
 
-pub fn setCursorRect(self: *Self, rect: Rect) void {
-    _ = self;
-    _ = rect;
-    log.err("Not Implemented", .{});
-    unreachable;
-}
-
 pub fn setPointerShape(self: *Self, shape: Shape) void {
     _ = self;
     _ = shape;
@@ -137,29 +123,41 @@ pub fn setPointerShape(self: *Self, shape: Shape) void {
     unreachable;
 }
 
-pub fn pointerButtonIsPressed(self: *Self, button: Button) bool {
+pub fn buttonIsPressed(self: *Self, button: Button) bool {
     _ = self;
     _ = button;
     log.err("Not Implemented", .{});
     unreachable;
 }
 
-fn wlRegistryGlobal(
-    data: ?*anyopaque,
-    registry: ?*c.wl_registry,
-    name: u32,
-    interface: [*c]const u8,
-    version: u32,
-) callconv(.c) void {
-    _ = data;
-    _ = registry;
-    _ = name;
-
-    log.debug("{s} is available in {d} version", .{ interface, version });
+pub fn keyIsPressed(self: *Self, key: Key) bool {
+    _ = self;
+    _ = key;
+    log.err("Not Implemented", .{});
+    unreachable;
 }
 
-fn wlRegistryGlobalRemove(data: ?*anyopaque, registry: ?*c.wl_registry, name: u32) callconv(.c) void {
-    _ = data;
-    _ = registry;
-    _ = name;
+pub fn getModifiers(self: *Self) Modifiers {
+    _ = self;
+    log.err("Not Implemented", .{});
+    unreachable;
+}
+
+pub fn textInputEnable(self: *Self) void {
+    _ = self;
+    log.err("Not Implemented", .{});
+    unreachable;
+}
+
+pub fn textInputDisable(self: *Self) void {
+    _ = self;
+    log.err("Not Implemented", .{});
+    unreachable;
+}
+
+pub fn textInputSetRect(self: *Self, rect: Rect) void {
+    _ = self;
+    _ = rect;
+    log.err("Not Implemented", .{});
+    unreachable;
 }

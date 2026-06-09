@@ -18,6 +18,12 @@ pub fn build(b: *std.Build) void {
     const options = b.addOptions();
     options.addOption(Backend, "backend", backend);
 
+    const core = b.addModule("core", .{
+        .root_source_file = b.path("src/core/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     const c_translate = b.addTranslateC(.{
         .root_source_file = b.path("src/c.h"),
         .target = target,
@@ -30,13 +36,15 @@ pub fn build(b: *std.Build) void {
     c.addCSourceFile(.{ .file = b.path("deps/wayland-protocols/wp-cursor-shape-v1.c") });
     c.addCSourceFile(.{ .file = b.path("deps/wayland-protocols/zwp-tablet-v2.c") });
     c.addCSourceFile(.{ .file = b.path("deps/wayland-protocols/xdg-shell.c") });
-    c.addCSourceFile(.{ .file = b.path("deps/wayland-protocols/zwp-text-input-unstable-v3.c") });
 
     const platform = b.addModule("platform", .{
-        .root_source_file = b.path("src/core/platform/root.zig"),
+        .root_source_file = b.path("src/platform/root.zig"),
         .target = target,
         .optimize = optimize,
-        .imports = &.{.{ .name = "c", .module = c }},
+        .imports = &.{
+            .{ .name = "c", .module = c },
+            .{ .name = "core", .module = core },
+        },
     });
     platform.addOptions("options", options);
 
