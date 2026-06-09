@@ -36,6 +36,7 @@ pub fn build(b: *std.Build) void {
     c.addCSourceFile(.{ .file = b.path("deps/wayland-protocols/wp-cursor-shape-v1.c") });
     c.addCSourceFile(.{ .file = b.path("deps/wayland-protocols/zwp-tablet-v2.c") });
     c.addCSourceFile(.{ .file = b.path("deps/wayland-protocols/xdg-shell.c") });
+    c.addCSourceFile(.{ .file = b.path("deps/wayland-protocols/zxdg-decoration-v1.c") });
 
     const platform = b.addModule("platform", .{
         .root_source_file = b.path("src/platform/root.zig"),

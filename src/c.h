@@ -4,3 +4,4 @@
 #include <xdg-shell-client.h>
 #include <xkbcommon/xkbcommon-compose.h>
 #include <xkbcommon/xkbcommon.h>
+#include <zxdg-decoration-v1-client.h>

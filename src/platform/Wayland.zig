@@ -183,6 +183,9 @@ const Impl = struct {
     xkb_compose_table: ?*c.xkb_compose_table = null,
     xkb_compose_state: ?*c.xkb_compose_state = null,
 
+    zxdg_decoration_manager_v1: ?*c.zxdg_decoration_manager_v1 = null,
+    zxdg_toplevel_decoration_v1: ?*c.zxdg_toplevel_decoration_v1 = null,
+
     events: Queue(Event, 256) = .empty,
     resized: bool = false,
     title: [4096:0]u8 = .{0} ** 4096,
@@ -233,6 +236,15 @@ pub fn init(allocator: std.mem.Allocator, io: std.Io) !Self {
     self.impl.xdg_surface = c.xdg_wm_base_get_xdg_surface(self.impl.xdg_wm_base, self.impl.wl_surface);
     self.impl.xdg_toplevel = c.xdg_surface_get_toplevel(self.impl.xdg_surface);
 
+    if (self.impl.zxdg_decoration_manager_v1) |zxdg_decoration_manager_v1| {
+        self.impl.zxdg_toplevel_decoration_v1 = c.zxdg_decoration_manager_v1_get_toplevel_decoration(
+            zxdg_decoration_manager_v1,
+            self.impl.xdg_toplevel,
+        );
+    } else {
+        log.warn("xdg toplevel decoration protocol not supported", .{});
+    }
+
     _ = c.xdg_surface_add_listener(self.impl.xdg_surface, &xdg_surface_listener, self.impl);
     _ = c.xdg_toplevel_add_listener(self.impl.xdg_toplevel, &xdg_toplevel_listener, self.impl);
     configureWlShmPool(self.impl);
@@ -260,6 +272,9 @@ pub fn deinit(self: *Self, allocator: std.mem.Allocator) void {
     secureDeinit(self.impl.wl_shm_pool, c.wl_shm_pool_destroy);
     secureDeinit(self.impl.wl_keyboard, c.wl_keyboard_destroy);
     secureDeinit(self.impl.wl_pointer, c.wl_pointer_destroy);
+
+    secureDeinit(self.impl.zxdg_decoration_manager_v1, c.zxdg_decoration_manager_v1_destroy);
+    secureDeinit(self.impl.zxdg_toplevel_decoration_v1, c.zxdg_toplevel_decoration_v1_destroy);
 
     secureDeinit(self.impl.wp_cursor_shape_manager_v1, c.wp_cursor_shape_manager_v1_destroy);
     secureDeinit(self.impl.wp_cursor_shape_device_v1, c.wp_cursor_shape_device_v1_destroy);
@@ -359,6 +374,28 @@ pub fn setFullscreen(self: *Self) void {
 
 pub fn unsetFullscreen(self: *Self) void {
     c.xdg_toplevel_unset_fullscreen(self.impl.xdg_toplevel);
+}
+
+pub fn setBorderless(self: *Self) void {
+    if (self.impl.zxdg_toplevel_decoration_v1) |zxdg_toplevel_decoration_v1| {
+        c.zxdg_toplevel_decoration_v1_set_mode(
+            zxdg_toplevel_decoration_v1,
+            c.ZXDG_TOPLEVEL_DECORATION_V1_MODE_CLIENT_SIDE,
+        );
+    } else {
+        log.warn("xdg toplevel decoration protocol not supported", .{});
+    }
+}
+
+pub fn unsetBorderless(self: *Self) void {
+    if (self.impl.zxdg_toplevel_decoration_v1) |zxdg_toplevel_decoration_v1| {
+        c.zxdg_toplevel_decoration_v1_set_mode(
+            zxdg_toplevel_decoration_v1,
+            c.ZXDG_TOPLEVEL_DECORATION_V1_MODE_SERVER_SIDE,
+        );
+    } else {
+        log.warn("xdg toplevel decoration protocol not supported", .{});
+    }
 }
 
 pub fn maximize(self: *Self) void {
@@ -470,6 +507,11 @@ fn wlRegistryGlobal(
     if (std.mem.eql(u8, std.mem.span(interface), std.mem.span(c.wp_cursor_shape_manager_v1_interface.name))) {
         impl.wp_cursor_shape_manager_v1 = @ptrCast(
             @alignCast(c.wl_registry_bind(wl_registry, name, &c.wp_cursor_shape_manager_v1_interface, 1)),
+        );
+    }
+    if (std.mem.eql(u8, std.mem.span(interface), std.mem.span(c.zxdg_decoration_manager_v1_interface.name))) {
+        impl.zxdg_decoration_manager_v1 = @ptrCast(
+            @alignCast(c.wl_registry_bind(wl_registry, name, &c.zxdg_decoration_manager_v1_interface, 1)),
         );
     }
 }
