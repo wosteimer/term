@@ -53,6 +53,18 @@ pub fn unsetFullscreen(self: *Self) void {
     unreachable;
 }
 
+pub fn setBorderless(self: *Self) void {
+    _ = self;
+    log.err("Not Implemented", .{});
+    unreachable;
+}
+
+pub fn unsetBorderless(self: *Self) void {
+    _ = self;
+    log.err("Not Implemented", .{});
+    unreachable;
+}
+
 pub fn maximize(self: *Self) void {
     _ = self;
 }

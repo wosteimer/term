@@ -196,6 +196,8 @@ const Impl = struct {
     max_width: u32 = 200,
     max_height: u32 = 200,
     buffer: ?[]u32 = null,
+    presented: bool = false,
+    started: bool = false,
 
     pointer_shape: Shape = .default,
     pointer_state: [pointer_state_len]bool = .{false} ** pointer_state_len,
@@ -305,7 +307,8 @@ inline fn secureDeinit(obj: anytype, deinitFn: fn (@TypeOf(obj)) callconv(.c) vo
 
 pub fn present(self: *Self) void {
     self.impl.events.clear();
-    _ = c.wl_display_dispatch(self.impl.wl_display);
+    self.impl.presented = false;
+    while (!self.impl.presented) _ = c.wl_display_dispatch(self.impl.wl_display);
     if (!self.impl.text_input_enabled) return;
     const current = std.Io.Timestamp.now(self.impl.io, .awake).toMilliseconds();
     const elapsed = current - self.impl.text_input_time;
@@ -568,8 +571,11 @@ fn xdgSurfaceConfigure(user_data: ?*anyopaque, xdg_surface: ?*c.xdg_surface, ser
         impl.resized = false;
         configureWlShmPool(impl);
     }
-    drawFrame(impl);
-    c.wl_surface_commit(impl.wl_surface);
+    if (!impl.started) {
+        drawFrame(impl);
+        c.wl_surface_commit(impl.wl_surface);
+        impl.started = true;
+    }
 }
 
 fn drawFrame(impl: *Impl) void {
@@ -664,12 +670,15 @@ fn xdgToplevelWmCapabilities(
 fn wlCallbackDone(user_data: ?*anyopaque, wl_callback: ?*c.wl_callback, time: u32) callconv(.c) void {
     _ = time;
     const impl: *Impl = @ptrCast(@alignCast(user_data));
+
     c.wl_callback_destroy(wl_callback);
-    drawFrame(impl);
     const new_wl_callback = c.wl_surface_frame(impl.wl_surface);
     impl.wl_callback = new_wl_callback;
     _ = c.wl_callback_add_listener(new_wl_callback, &wl_callback_listener, impl);
+
+    drawFrame(impl);
     c.wl_surface_commit(impl.wl_surface);
+    impl.presented = true;
 }
 
 fn wlBufferRelease(user_data: ?*anyopaque, wl_buffer: ?*c.wl_buffer) callconv(.c) void {

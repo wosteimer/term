@@ -1,13 +1,13 @@
 const std = @import("std");
 
+const Backend = enum {
+    wayland,
+    x11,
+};
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
-
-    const Backend = enum {
-        wayland,
-        x11,
-    };
 
     const backend = b.option(
         Backend,
@@ -29,14 +29,37 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    c_translate.linkSystemLibrary("wayland-client", .{});
-    c_translate.linkSystemLibrary("xkbcommon", .{});
-    c_translate.addIncludePath(b.path("deps/wayland-protocols/"));
+    c_translate.linkSystemLibrary("pixman-1", .{});
+    c_translate.linkSystemLibrary("fontconfig", .{});
+    c_translate.linkSystemLibrary("harfbuzz", .{});
+    c_translate.linkSystemLibrary("freetype2", .{});
+    c_translate.addIncludePath(b.path("deps/stb_rect_pack/"));
+    c_translate.addIncludePath(b.path("deps/utf8proc"));
+    switch (backend) {
+        .wayland => {
+            c_translate.defineCMacro("LINUX_PLATFORM_WAYLAND", null);
+            c_translate.linkSystemLibrary("wayland-client", .{});
+            c_translate.linkSystemLibrary("xkbcommon", .{});
+            c_translate.addIncludePath(b.path("deps/wayland-protocols/"));
+        },
+        .x11 => {
+            c_translate.defineCMacro("LINUX_PLATFORM_X11", null);
+        },
+    }
+
     const c = c_translate.createModule();
-    c.addCSourceFile(.{ .file = b.path("deps/wayland-protocols/wp-cursor-shape-v1.c") });
-    c.addCSourceFile(.{ .file = b.path("deps/wayland-protocols/zwp-tablet-v2.c") });
-    c.addCSourceFile(.{ .file = b.path("deps/wayland-protocols/xdg-shell.c") });
-    c.addCSourceFile(.{ .file = b.path("deps/wayland-protocols/zxdg-decoration-v1.c") });
+    c.addIncludePath(b.path("deps/stb_rect_pack/"));
+    c.addCSourceFile(.{ .file = b.path("deps/stb_rect_pack/stb_rect_pack.c") });
+    c.addCSourceFile(.{ .file = b.path("deps/utf8proc/utf8proc.c") });
+    switch (backend) {
+        .wayland => {
+            c.addCSourceFile(.{ .file = b.path("deps/wayland-protocols/wp-cursor-shape-v1.c") });
+            c.addCSourceFile(.{ .file = b.path("deps/wayland-protocols/zwp-tablet-v2.c") });
+            c.addCSourceFile(.{ .file = b.path("deps/wayland-protocols/xdg-shell.c") });
+            c.addCSourceFile(.{ .file = b.path("deps/wayland-protocols/zxdg-decoration-v1.c") });
+        },
+        .x11 => {},
+    }
 
     const platform = b.addModule("platform", .{
         .root_source_file = b.path("src/platform/root.zig"),
@@ -49,6 +72,19 @@ pub fn build(b: *std.Build) void {
     });
     platform.addOptions("options", options);
 
+    const unicode = compileUnicode(b, c, target, optimize);
+
+    const render = b.addModule("Render", .{
+        .root_source_file = b.path("src/Render.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "platform", .module = platform },
+            .{ .name = "unicode", .module = unicode },
+            .{ .name = "c", .module = c },
+        },
+    });
+
     const exe = b.addExecutable(.{
         .name = "term",
         .use_llvm = true,
@@ -58,6 +94,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "platform", .module = platform },
+                .{ .name = "Render", .module = render },
             },
         }),
     });
@@ -77,12 +114,45 @@ pub fn build(b: *std.Build) void {
         .root_module = exe.root_module,
     });
 
-    // A run step that will run the second test executable.
     const run_exe_tests = b.addRunArtifact(exe_tests);
 
-    // A top level step for running all tests. dependOn can be called multiple
-    // times and since the two run steps do not depend on one another, this will
-    // make the two of them run in parallel.
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_exe_tests.step);
+}
+
+fn compileUnicode(
+    b: *std.Build,
+    c: *std.Build.Module,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+) *std.Build.Module {
+    const generator = b.addExecutable(.{
+        .name = "generator",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/generate-emoji-sequences.zig"),
+            .target = b.graph.host,
+        }),
+    });
+    const generator_run = b.addRunArtifact(generator);
+    const generator_output = generator_run.addOutputFileArg("emoji.zig");
+    generator_run.addFileArg(b.path("emoji/emoji-sequences.txt"));
+    generator_run.addFileArg(b.path("emoji/emoji-zwj-sequences.txt"));
+
+    const emoji = b.addModule("emoji", .{
+        .root_source_file = generator_output,
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const unicode = b.addModule("unicode", .{
+        .root_source_file = b.path("src/unicode.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "emoji", .module = emoji },
+            .{ .name = "c", .module = c },
+        },
+    });
+
+    return unicode;
 }
