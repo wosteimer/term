@@ -101,10 +101,26 @@ pub const Size = struct { width: u32, height: u32 };
 pub const Event = union(enum) {
     pub const WindowResized = struct { width: u32, height: u32 };
 
+    pub const Fd = struct {
+        pub const Type = enum {
+            in,
+            out,
+            err,
+            hup,
+        };
+        fd: i32,
+        type: Type,
+    };
+
     pub const KeyboardKey = struct {
         key: Key,
         raw: u32, // NOTE: system dependent scancode
+        repeat: bool,
         modifiers: Modifiers,
+    };
+
+    pub const KeyboardFocus = struct {
+        focus: bool,
     };
 
     pub const PointerButton = struct {
@@ -112,18 +128,23 @@ pub const Event = union(enum) {
         raw: u32, // NOTE: system dependent scancode
     };
 
-    pub const PointerMotion = struct { x: u32, y: u32 };
+    pub const PointerMotion = struct { x: i32, y: i32 };
 
     pub const PointerWheel = struct { x: f32, y: f32 };
 
     window_close_requested: void,
     window_resized: WindowResized,
-    key_down: KeyboardKey,
-    key_up: KeyboardKey,
+    keyboard_key_down: KeyboardKey,
+    keyboard_key_up: KeyboardKey,
+    keyboard_focus: KeyboardFocus,
     text_input_preedit_changed: []const u8,
+    text_input_preedit_cancel: void,
     text_input_changed: []const u8,
     pointer_button_down: PointerButton,
     pointer_button_up: PointerButton,
     pointer_motion: PointerMotion,
     pointer_wheel: PointerWheel,
+    fd: Fd,
 };
+
+pub const FdListenerCallback = *const fn (?*anyopaque, Event.Fd.Type) void;

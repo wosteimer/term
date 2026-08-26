@@ -5,86 +5,64 @@ const c = @import("c");
 pub const isEmoji = emoji.isEmoji;
 
 pub const GraphemeIter = struct {
+    const max_grapheme_len = 64;
+
+    pub const Grapheme = struct { bytes: []const u8, codepoints: []const u21 };
+
+    const Codepoint = struct { codepoint: u21, len: usize };
+
     text: []const u8,
-    i: u64 = 0,
     state: i32 = 0,
-    allocator: ?std.mem.Allocator = null,
+    i: usize = 0,
+    buf_accum: [max_grapheme_len]u21 = undefined,
     accum: std.ArrayList(u21) = .empty,
 
-    pub fn init(allocator: std.mem.Allocator, text: []const u8) GraphemeIter {
-        return .{
-            .text = text,
-            .allocator = allocator,
-        };
+    pub fn init(self: *GraphemeIter, text: []const u8) void {
+        self.* = .{ .text = text, .accum = .initBuffer(&self.buf_accum) };
     }
 
-    pub fn bufInit(buf: []u21, text: []const u8) GraphemeIter {
-        return .{
-            .text = text,
-            .accum = .initBuffer(buf),
-        };
-    }
-
-    pub fn deinit(self: *GraphemeIter) void {
-        if (self.allocator) |allocator| self.accum.deinit(allocator);
-    }
-
-    pub const Result = struct {
-        rune: []const u8,
-        grapheme: []const u21,
-    };
-
-    pub fn next(self: *GraphemeIter) !?Result {
-        const start = self.i;
+    pub fn next(self: *GraphemeIter) !?Grapheme {
         self.accum.clearRetainingCapacity();
-        while (self.nextCodepoint()) |current_codepoint| {
-            if (self.allocator) |allocator| {
-                try self.accum.append(allocator, @intCast(current_codepoint));
-            } else {
-                try self.accum.appendBounded(@intCast(current_codepoint));
-            }
-            if (self.peekCodepoint()) |next_codepoint| {
-                if (c.utf8proc_grapheme_break_stateful(current_codepoint, next_codepoint, &self.state)) {
-                    return .{
-                        .rune = self.text[start..self.i],
-                        .grapheme = self.accum.items,
-                    };
+        const start = self.i;
+        var end = self.i;
+        while (try self.takeCodepoint()) |current_codepoint| {
+            self.accum.appendAssumeCapacity(current_codepoint.codepoint);
+            end += current_codepoint.len;
+            if (try self.peekCodepoint()) |next_codepoint| {
+                if (c.utf8proc_grapheme_break_stateful(current_codepoint.codepoint, next_codepoint.codepoint, &self.state)) {
+                    return .{ .bytes = self.text[start..end], .codepoints = self.accum.items };
                 }
-            } else {
-                return .{
-                    .rune = self.text[start..],
-                    .grapheme = self.accum.items,
-                };
             }
+        }
+        if (self.accum.items.len == 0) return null;
+        if (c.utf8proc_grapheme_break_stateful(self.accum.getLast(), 0, &self.state)) {
+            return .{ .bytes = self.text[start..end], .codepoints = self.accum.items };
         }
         return null;
     }
 
-    fn nextCodepoint(self: *GraphemeIter) ?i32 {
-        var codepoint: i32 = undefined;
-        const readed = c.utf8proc_iterate(
-            self.text.ptr + self.i,
-            @intCast(self.text.len - self.i),
-            &codepoint,
-        );
-        if (readed <= 0) return null;
-        self.i += @intCast(readed);
-        return codepoint;
+    fn takeCodepoint(self: *GraphemeIter) !?Codepoint {
+        if (try self.peekCodepoint()) |entry| {
+            self.i += entry.len;
+            return entry;
+        }
+        self.i = self.text.len;
+        return null;
     }
 
-    fn peekCodepoint(self: *GraphemeIter) ?i32 {
+    fn peekCodepoint(self: *GraphemeIter) !?Codepoint {
+        const buf = self.text[self.i..];
         var codepoint: i32 = undefined;
-        const readed = c.utf8proc_iterate(
-            self.text.ptr + self.i,
-            @intCast(self.text.len - self.i),
-            &codepoint,
-        );
-        if (readed <= 0) return null;
-        return codepoint;
+        const len = c.utf8proc_iterate(buf.ptr, @intCast(buf.len), &codepoint);
+        if (len == 0) return null;
+        if (len < 0) {
+            return error.InvalidBytes;
+        }
+        return .{ .codepoint = @intCast(codepoint), .len = @intCast(len) };
     }
 };
 
-pub fn charWidth(grapheme: []const u21) u32 {
-    if (isEmoji(grapheme)) return 2;
-    return @intCast(c.utf8proc_charwidth(grapheme[0]));
+pub fn charWidth(codepoints: []const u21) u32 {
+    if (isEmoji(codepoints)) return 2;
+    return @intCast(c.utf8proc_charwidth(codepoints[0]));
 }

@@ -37,12 +37,12 @@ pub fn main(init: std.process.Init) !void {
                 const second_start = first_end + 2;
                 const second_end = std.mem.indexOfScalar(u8, line, ';').?;
                 const second = std.mem.trim(u8, line[second_start..second_end], &std.ascii.whitespace);
-                for (try std.fmt.parseInt(usize, first, 16)..try std.fmt.parseInt(usize, second, 16)) |codepoint| {
+                for (try std.fmt.parseInt(usize, first, 16)..try std.fmt.parseInt(usize, second, 16) + 1) |codepoint| {
                     try hashes.append(allocator, hashEmoji(&[_]u21{@intCast(codepoint)}));
                 }
             } else {
                 const end = std.mem.indexOfScalar(u8, line, ';').?;
-                var iter = std.mem.splitScalar(u8, std.mem.trim(u8, line[0..end], &std.ascii.whitespace), ' ');
+                var iter = std.mem.splitAny(u8, std.mem.trim(u8, line[0..end], &std.ascii.whitespace), &std.ascii.whitespace);
                 var codepoints: [64]u21 = undefined;
                 var i: usize = 0;
                 while (iter.next()) |hex| {

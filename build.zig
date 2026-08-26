@@ -18,12 +18,6 @@ pub fn build(b: *std.Build) void {
     const options = b.addOptions();
     options.addOption(Backend, "backend", backend);
 
-    const core = b.addModule("core", .{
-        .root_source_file = b.path("src/core/root.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-
     const c_translate = b.addTranslateC(.{
         .root_source_file = b.path("src/c.h"),
         .target = target,
@@ -61,29 +55,34 @@ pub fn build(b: *std.Build) void {
         .x11 => {},
     }
 
-    const platform = b.addModule("platform", .{
-        .root_source_file = b.path("src/platform/root.zig"),
+    const generator = b.addExecutable(.{
+        .name = "generator",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/generate-emoji-sequences.zig"),
+            .target = b.graph.host,
+        }),
+    });
+    const generator_run = b.addRunArtifact(generator);
+    const generator_output = generator_run.addOutputFileArg("emoji.zig");
+    generator_run.addFileArg(b.path("emoji/emoji-sequences.txt"));
+    generator_run.addFileArg(b.path("emoji/emoji-zwj-sequences.txt"));
+
+    const emoji = b.addModule("emoji", .{
+        .root_source_file = generator_output,
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const term = b.addModule("term", .{
+        .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
             .{ .name = "c", .module = c },
-            .{ .name = "core", .module = core },
+            .{ .name = "emoji", .module = emoji },
         },
     });
-    platform.addOptions("options", options);
-
-    const unicode = compileUnicode(b, c, target, optimize);
-
-    const render = b.addModule("Render", .{
-        .root_source_file = b.path("src/Render.zig"),
-        .target = target,
-        .optimize = optimize,
-        .imports = &.{
-            .{ .name = "platform", .module = platform },
-            .{ .name = "unicode", .module = unicode },
-            .{ .name = "c", .module = c },
-        },
-    });
+    term.addOptions("options", options);
 
     const exe = b.addExecutable(.{
         .name = "term",
@@ -93,8 +92,7 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
             .imports = &.{
-                .{ .name = "platform", .module = platform },
-                .{ .name = "Render", .module = render },
+                .{ .name = "term", .module = term },
             },
         }),
     });
@@ -118,41 +116,4 @@ pub fn build(b: *std.Build) void {
 
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_exe_tests.step);
-}
-
-fn compileUnicode(
-    b: *std.Build,
-    c: *std.Build.Module,
-    target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
-) *std.Build.Module {
-    const generator = b.addExecutable(.{
-        .name = "generator",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("tools/generate-emoji-sequences.zig"),
-            .target = b.graph.host,
-        }),
-    });
-    const generator_run = b.addRunArtifact(generator);
-    const generator_output = generator_run.addOutputFileArg("emoji.zig");
-    generator_run.addFileArg(b.path("emoji/emoji-sequences.txt"));
-    generator_run.addFileArg(b.path("emoji/emoji-zwj-sequences.txt"));
-
-    const emoji = b.addModule("emoji", .{
-        .root_source_file = generator_output,
-        .target = target,
-        .optimize = optimize,
-    });
-
-    const unicode = b.addModule("unicode", .{
-        .root_source_file = b.path("src/unicode.zig"),
-        .target = target,
-        .optimize = optimize,
-        .imports = &.{
-            .{ .name = "emoji", .module = emoji },
-            .{ .name = "c", .module = c },
-        },
-    });
-
-    return unicode;
 }

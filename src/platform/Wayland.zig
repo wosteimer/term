@@ -7,18 +7,13 @@ const Button = @import("common.zig").Button;
 const Key = @import("common.zig").Key;
 const Modifiers = @import("common.zig").Modifiers;
 const Event = @import("common.zig").Event;
-const Queue = @import("core").Queue;
+const Queue = @import("../core/queue.zig").Queue;
+const DateTime = @import("../core/DateTime.zig").DateTime;
+const FdListenerCallback = @import("common.zig").FdListenerCallback;
 
 const log = std.log.scoped(.wayland);
 
 const Self = @This();
-
-const TextInputState = enum {
-    none,
-    pressed,
-    holding,
-    repeating,
-};
 
 const wl_registry_listener = c.wl_registry_listener{
     .global = wlRegistryGlobal,
@@ -43,10 +38,6 @@ const xdg_toplevel_listener = c.xdg_toplevel_listener{
     .configure = xdgToplevelConfigure,
     .configure_bounds = xdgToplevelConfigureBounds,
     .wm_capabilities = xdgToplevelWmCapabilities,
-};
-
-const wl_callback_listener = c.wl_callback_listener{
-    .done = wlCallbackDone,
 };
 
 const wl_buffer_listener = c.wl_buffer_listener{
@@ -78,8 +69,7 @@ const wl_pointer_listener = c.wl_pointer_listener{
 
 const evdev_key_max = 256;
 const evdev_to_key = blk: {
-    var table: [evdev_key_max]Key = undefined;
-    for (&table) |*value| value.* = .unknown;
+    var table: [evdev_key_max]Key = [_]Key{.unknown} ** evdev_key_max;
     for (std.ascii.lowercase) |letter| {
         table[@field(c, "KEY_" ++ .{std.ascii.toUpper(letter)})] = @field(Key, &.{letter});
     }
@@ -152,196 +142,210 @@ const evdev_to_key = blk: {
     break :blk table;
 };
 
-const keyboard_state_len = @typeInfo(Key).@"enum".fields.len;
-const pointer_state_len = @typeInfo(Button).@"enum".fields.len;
+const buffers_len = 2;
+const keyboard_self_len = @typeInfo(Key).@"enum".fields.len;
+const pointer_self_len = @typeInfo(Button).@"enum".fields.len;
+const text_input_buf_len = 64;
 
-const Impl = struct {
-    io: std.Io,
-
-    wl_display: ?*c.wl_display = null,
-    wl_registry: ?*c.wl_registry = null,
-    wl_compositor: ?*c.wl_compositor = null,
-    wl_surface: ?*c.wl_surface = null,
-    wl_seat: ?*c.wl_seat = null,
-    wl_shm: ?*c.wl_shm = null,
-    wl_shm_pool: ?*c.wl_shm_pool = null,
+const Buffer = struct {
     wl_buffer: ?*c.wl_buffer = null,
-    wl_callback: ?*c.wl_callback = null,
-    wl_keyboard: ?*c.wl_keyboard = null,
-    wl_pointer: ?*c.wl_pointer = null,
-
-    wp_cursor_shape_manager_v1: ?*c.wp_cursor_shape_manager_v1 = null,
-    wp_cursor_shape_device_v1: ?*c.wp_cursor_shape_device_v1 = null,
-
-    xdg_wm_base: ?*c.xdg_wm_base = null,
-    xdg_surface: ?*c.xdg_surface = null,
-    xdg_toplevel: ?*c.xdg_toplevel = null,
-
-    xkb_context: ?*c.xkb_context = null,
-    xkb_state: ?*c.xkb_state = null,
-    xkb_keymap: ?*c.xkb_keymap = null,
-    xkb_compose_table: ?*c.xkb_compose_table = null,
-    xkb_compose_state: ?*c.xkb_compose_state = null,
-
-    zxdg_decoration_manager_v1: ?*c.zxdg_decoration_manager_v1 = null,
-    zxdg_toplevel_decoration_v1: ?*c.zxdg_toplevel_decoration_v1 = null,
-
-    events: Queue(Event, 256) = .empty,
-    resized: bool = false,
-    title: [4096:0]u8 = .{0} ** 4096,
-    width: u32 = 200,
-    height: u32 = 200,
-    min_width: u32 = 200,
-    min_height: u32 = 200,
-    max_width: u32 = 200,
-    max_height: u32 = 200,
-    buffer: ?[]u32 = null,
-    presented: bool = false,
-    started: bool = false,
-
-    pointer_shape: Shape = .default,
-    pointer_state: [pointer_state_len]bool = .{false} ** pointer_state_len,
-    pointer_serial: u32 = 0,
-    pointer_position_changed: bool = false,
-    pointer_position_x: u32 = 0,
-    pointer_position_y: u32 = 0,
-    pointer_axis_changed: bool = false,
-    pointer_axis_x: f32 = 0,
-    pointer_axis_y: f32 = 0,
-
-    keyboard_state: [keyboard_state_len]bool = .{false} ** keyboard_state_len,
-    text_input_rate: u32 = 0,
-    text_input_delay: u32 = 0,
-    text_input_enabled: bool = false,
-    text_input_preedit: [4096:0]u8 = .{0} ** 4096,
-    text_input_state: TextInputState = .none,
-    text_input_time: i64 = 0,
-    text_input_last_keysym: u32 = 0,
+    pixels: []u32 = undefined,
+    busy: bool = true,
 };
 
-impl: *Impl,
+wl_display: ?*c.wl_display = null,
+wl_registry: ?*c.wl_registry = null,
+wl_compositor: ?*c.wl_compositor = null,
+wl_surface: ?*c.wl_surface = null,
+wl_seat: ?*c.wl_seat = null,
+wl_shm: ?*c.wl_shm = null,
+wl_shm_pool: ?*c.wl_shm_pool = null,
+wl_shm_pool_size: u32 = 0,
+wl_keyboard: ?*c.wl_keyboard = null,
+wl_pointer: ?*c.wl_pointer = null,
 
-pub fn init(allocator: std.mem.Allocator, io: std.Io) !Self {
-    var self = Self{
-        .impl = try allocator.create(Impl),
-    };
-    self.impl.* = .{ .io = io };
-    self.impl.wl_display = c.wl_display_connect(null);
-    self.impl.wl_registry = c.wl_display_get_registry(self.impl.wl_display);
-    _ = c.wl_registry_add_listener(self.impl.wl_registry, &wl_registry_listener, self.impl);
-    _ = c.wl_display_roundtrip(self.impl.wl_display);
+wp_cursor_shape_manager_v1: ?*c.wp_cursor_shape_manager_v1 = null,
+wp_cursor_shape_device_v1: ?*c.wp_cursor_shape_device_v1 = null,
 
-    _ = c.xdg_wm_base_add_listener(self.impl.xdg_wm_base, &xdg_wm_base_listener, self.impl);
-    _ = c.wl_seat_add_listener(self.impl.wl_seat, &wl_seat_listener, self.impl);
+xdg_wm_base: ?*c.xdg_wm_base = null,
+xdg_surface: ?*c.xdg_surface = null,
+xdg_toplevel: ?*c.xdg_toplevel = null,
 
-    self.impl.wl_surface = c.wl_compositor_create_surface(self.impl.wl_compositor);
-    self.impl.xdg_surface = c.xdg_wm_base_get_xdg_surface(self.impl.xdg_wm_base, self.impl.wl_surface);
-    self.impl.xdg_toplevel = c.xdg_surface_get_toplevel(self.impl.xdg_surface);
+xkb_context: ?*c.xkb_context = null,
+xkb_state: ?*c.xkb_state = null,
+xkb_keymap: ?*c.xkb_keymap = null,
+xkb_compose_table: ?*c.xkb_compose_table = null,
+xkb_compose_state: ?*c.xkb_compose_state = null,
 
-    if (self.impl.zxdg_decoration_manager_v1) |zxdg_decoration_manager_v1| {
-        self.impl.zxdg_toplevel_decoration_v1 = c.zxdg_decoration_manager_v1_get_toplevel_decoration(
+zxdg_decoration_manager_v1: ?*c.zxdg_decoration_manager_v1 = null,
+zxdg_toplevel_decoration_v1: ?*c.zxdg_toplevel_decoration_v1 = null,
+
+events: Queue(Event, 256) = .empty,
+resize_pending: bool = false,
+title: [4096:0]u8 = .{0} ** 4096,
+width: u32 = 200,
+height: u32 = 200,
+buffers: [buffers_len]Buffer = [_]Buffer{.{}} ** buffers_len,
+pending_present: ?*Buffer = null,
+min_width: u32 = 0,
+min_height: u32 = 0,
+max_width: u32 = 0,
+max_height: u32 = 0,
+pixels: ?[]u32 = null,
+epoll_fd: std.os.linux.fd_t = -1,
+fd_map: std.AutoHashMap(i32, struct { callback: FdListenerCallback, user_data: ?*anyopaque }) = undefined,
+
+pointer_shape: Shape = .default,
+pointer_self: [pointer_self_len]bool = .{false} ** pointer_self_len,
+pointer_serial: u32 = 0,
+pointer_position_changed: bool = false,
+pointer_position_x: i32 = 0,
+pointer_position_y: i32 = 0,
+pointer_axis_changed: bool = false,
+pointer_axis_x: f32 = 0,
+pointer_axis_y: f32 = 0,
+
+keyboard_self: [keyboard_self_len]bool = .{false} ** keyboard_self_len,
+keyboard_last_key: u32 = 0,
+keyboard_repeat_mode: bool = false,
+keyboard_repeat_rate: u32 = 0,
+keyboard_repeat_delay: u32 = 0,
+text_input_enabled: bool = false,
+text_input_buf: [text_input_buf_len:0]u8 = .{0} ** text_input_buf_len,
+text_input_timer_fd: std.os.linux.fd_t = -1,
+
+pub fn init(self: *Self, allocator: std.mem.Allocator) void {
+    self.* = .{};
+    self.wl_display = c.wl_display_connect(null);
+    self.wl_registry = c.wl_display_get_registry(self.wl_display);
+    _ = c.wl_registry_add_listener(self.wl_registry, &wl_registry_listener, self);
+    _ = c.wl_display_roundtrip(self.wl_display);
+
+    _ = c.xdg_wm_base_add_listener(self.xdg_wm_base, &xdg_wm_base_listener, self);
+    _ = c.wl_seat_add_listener(self.wl_seat, &wl_seat_listener, self);
+
+    self.wl_surface = c.wl_compositor_create_surface(self.wl_compositor);
+    self.xdg_surface = c.xdg_wm_base_get_xdg_surface(self.xdg_wm_base, self.wl_surface);
+    self.xdg_toplevel = c.xdg_surface_get_toplevel(self.xdg_surface);
+
+    if (self.zxdg_decoration_manager_v1) |zxdg_decoration_manager_v1| {
+        self.zxdg_toplevel_decoration_v1 = c.zxdg_decoration_manager_v1_get_toplevel_decoration(
             zxdg_decoration_manager_v1,
-            self.impl.xdg_toplevel,
+            self.xdg_toplevel,
         );
     } else {
         log.warn("xdg toplevel decoration protocol not supported", .{});
     }
 
-    _ = c.xdg_surface_add_listener(self.impl.xdg_surface, &xdg_surface_listener, self.impl);
-    _ = c.xdg_toplevel_add_listener(self.impl.xdg_toplevel, &xdg_toplevel_listener, self.impl);
-    configureWlShmPool(self.impl);
-    self.impl.wl_callback = c.wl_surface_frame(self.impl.wl_surface);
-    _ = c.wl_callback_add_listener(self.impl.wl_callback, &wl_callback_listener, self.impl);
+    _ = c.xdg_surface_add_listener(self.xdg_surface, &xdg_surface_listener, self);
+    _ = c.xdg_toplevel_add_listener(self.xdg_toplevel, &xdg_toplevel_listener, self);
 
-    self.impl.xkb_context = c.xkb_context_new(c.XKB_CONTEXT_NO_FLAGS);
+    self.xkb_context = c.xkb_context_new(c.XKB_CONTEXT_NO_FLAGS);
     const locale = std.c.setlocale(.ALL, null) orelse std.c.setlocale(.CTYPE, null) orelse "C";
-    self.impl.xkb_compose_table = c.xkb_compose_table_new_from_locale(
-        self.impl.xkb_context,
+    self.xkb_compose_table = c.xkb_compose_table_new_from_locale(
+        self.xkb_context,
         locale,
         c.XKB_COMPOSE_COMPILE_NO_FLAGS,
     );
-    self.impl.xkb_compose_state = c.xkb_compose_state_new(
-        self.impl.xkb_compose_table,
+    self.xkb_compose_state = c.xkb_compose_state_new(
+        self.xkb_compose_table,
         c.XKB_COMPOSE_STATE_NO_FLAGS,
     );
-    c.wl_surface_commit(self.impl.wl_surface);
-    return self;
+
+    const epoll_fd = std.os.linux.epoll_create1(0);
+    std.debug.assert(epoll_fd != -1);
+    self.epoll_fd = @intCast(epoll_fd);
+
+    const wayland_fd = c.wl_display_get_fd(self.wl_display);
+    var wayland_event: std.os.linux.epoll_event = .{
+        .data = .{
+            .fd = wayland_fd,
+        },
+        .events = std.os.linux.EPOLL.IN | std.os.linux.EPOLL.ERR | std.os.linux.EPOLL.HUP,
+    };
+    var ok = std.os.linux.epoll_ctl(@intCast(epoll_fd), std.os.linux.EPOLL.CTL_ADD, wayland_fd, &wayland_event);
+    std.debug.assert(ok == 0);
+
+    const text_input_timer_fd = std.os.linux.timerfd_create(
+        std.os.linux.timerfd_clockid_t.MONOTONIC,
+        std.os.linux.TFD{ .NONBLOCK = true },
+    );
+    std.debug.assert(text_input_timer_fd != -1);
+    var text_input_timer_event: std.os.linux.epoll_event = .{
+        .data = .{
+            .fd = @intCast(text_input_timer_fd),
+        },
+        .events = std.os.linux.EPOLL.IN,
+    };
+    ok = std.os.linux.epoll_ctl(
+        @intCast(epoll_fd),
+        std.os.linux.EPOLL.CTL_ADD,
+        @intCast(text_input_timer_fd),
+        &text_input_timer_event,
+    );
+    std.debug.assert(ok == 0);
+    self.text_input_timer_fd = @intCast(text_input_timer_fd);
+
+    self.fd_map = .init(allocator);
+
+    c.wl_surface_commit(self.wl_surface);
 }
 
-pub fn deinit(self: *Self, allocator: std.mem.Allocator) void {
-    secureDeinit(self.impl.wl_buffer, c.wl_buffer_destroy);
-    secureDeinit(self.impl.wl_callback, c.wl_callback_destroy);
-    secureDeinit(self.impl.wl_shm_pool, c.wl_shm_pool_destroy);
-    secureDeinit(self.impl.wl_keyboard, c.wl_keyboard_destroy);
-    secureDeinit(self.impl.wl_pointer, c.wl_pointer_destroy);
+pub fn deinit(self: *Self) void {
+    for (&self.buffers) |*buffer| {
+        cleanup(c.wl_buffer_destroy, &buffer.wl_buffer, .{});
+    }
 
-    secureDeinit(self.impl.zxdg_decoration_manager_v1, c.zxdg_decoration_manager_v1_destroy);
-    secureDeinit(self.impl.zxdg_toplevel_decoration_v1, c.zxdg_toplevel_decoration_v1_destroy);
+    self.fd_map.deinit();
 
-    secureDeinit(self.impl.wp_cursor_shape_manager_v1, c.wp_cursor_shape_manager_v1_destroy);
-    secureDeinit(self.impl.wp_cursor_shape_device_v1, c.wp_cursor_shape_device_v1_destroy);
+    cleanup(c.wl_shm_pool_destroy, &self.wl_shm_pool, .{});
+    cleanup(c.wl_keyboard_destroy, &self.wl_keyboard, .{});
+    cleanup(c.wl_pointer_destroy, &self.wl_pointer, .{});
 
-    secureDeinit(self.impl.xkb_keymap, c.xkb_keymap_unref);
-    secureDeinit(self.impl.xkb_state, c.xkb_state_unref);
-    secureDeinit(self.impl.xkb_context, c.xkb_context_unref);
-    secureDeinit(self.impl.xkb_compose_table, c.xkb_compose_table_unref);
-    secureDeinit(self.impl.xkb_compose_state, c.xkb_compose_state_unref);
+    cleanup(c.zxdg_decoration_manager_v1_destroy, &self.zxdg_decoration_manager_v1, .{});
+    cleanup(c.zxdg_toplevel_decoration_v1_destroy, &self.zxdg_toplevel_decoration_v1, .{});
 
-    secureDeinit(self.impl.xdg_toplevel, c.xdg_toplevel_destroy);
-    secureDeinit(self.impl.xdg_surface, c.xdg_surface_destroy);
-    secureDeinit(self.impl.xdg_wm_base, c.xdg_wm_base_destroy);
+    cleanup(c.wp_cursor_shape_manager_v1_destroy, &self.wp_cursor_shape_manager_v1, .{});
+    cleanup(c.wp_cursor_shape_device_v1_destroy, &self.wp_cursor_shape_device_v1, .{});
 
-    secureDeinit(self.impl.wl_surface, c.wl_surface_destroy);
-    secureDeinit(self.impl.wl_seat, c.wl_seat_destroy);
-    secureDeinit(self.impl.wl_shm, c.wl_shm_destroy);
-    secureDeinit(self.impl.wl_compositor, c.wl_compositor_destroy);
-    secureDeinit(self.impl.wl_registry, c.wl_registry_destroy);
-    secureDeinit(self.impl.wl_display, c.wl_display_disconnect);
+    cleanup(c.xkb_keymap_unref, &self.xkb_keymap, .{});
+    cleanup(c.xkb_state_unref, &self.xkb_state, .{});
+    cleanup(c.xkb_context_unref, &self.xkb_context, .{});
+    cleanup(c.xkb_compose_table_unref, &self.xkb_compose_table, .{});
+    cleanup(c.xkb_compose_state_unref, &self.xkb_compose_state, .{});
 
-    allocator.destroy(self.impl);
+    cleanup(c.xdg_toplevel_destroy, &self.xdg_toplevel, .{});
+    cleanup(c.xdg_surface_destroy, &self.xdg_surface, .{});
+    cleanup(c.xdg_wm_base_destroy, &self.xdg_wm_base, .{});
+
+    cleanup(c.wl_surface_destroy, &self.wl_surface, .{});
+    cleanup(c.wl_seat_destroy, &self.wl_seat, .{});
+    cleanup(c.wl_shm_destroy, &self.wl_shm, .{});
+    cleanup(c.wl_compositor_destroy, &self.wl_compositor, .{});
+    cleanup(c.wl_registry_destroy, &self.wl_registry, .{});
+    cleanup(c.wl_display_disconnect, &self.wl_display, .{});
 }
 
-inline fn secureDeinit(obj: anytype, deinitFn: fn (@TypeOf(obj)) callconv(.c) void) void {
-    if (obj) |o| deinitFn(o);
-}
-
-pub fn present(self: *Self) void {
-    self.impl.events.clear();
-    self.impl.presented = false;
-    while (!self.impl.presented) _ = c.wl_display_dispatch(self.impl.wl_display);
-    if (!self.impl.text_input_enabled) return;
-    const current = std.Io.Timestamp.now(self.impl.io, .awake).toMilliseconds();
-    const elapsed = current - self.impl.text_input_time;
-    switch (self.impl.text_input_state) {
-        .pressed => {
-            self.impl.text_input_time = current;
-            self.impl.text_input_state = .holding;
-        },
-        .holding => {
-            if (self.impl.text_input_delay <= elapsed) {
-                c.xkb_compose_state_reset(self.impl.xkb_compose_state);
-                self.impl.text_input_state = .repeating;
-                self.impl.events.put(.{ .text_input_changed = getUtf8FromKeysym(self.impl.text_input_last_keysym) }) catch {
-                    log.warn("Event queue full, a text input event missed", .{});
-                };
-                self.impl.text_input_time = current;
-                self.impl.text_input_preedit = .{0} ** 4096;
-            }
-        },
-        .repeating => {
-            if (std.time.ms_per_s / self.impl.text_input_rate <= elapsed) {
-                self.impl.events.put(.{ .text_input_changed = getUtf8FromKeysym(self.impl.text_input_last_keysym) }) catch {
-                    log.warn("Event queue full, a text input event missed", .{});
-                };
-                self.impl.text_input_time = current;
-            }
-        },
-        .none => {},
+fn cleanup(cleanupFn: anytype, ptr_to_opt_ptr: anytype, extra_args: anytype) void {
+    if (ptr_to_opt_ptr.*) |ptr| {
+        @call(.auto, cleanupFn, .{ptr} ++ extra_args);
+        ptr_to_opt_ptr.* = null;
     }
 }
 
-fn getUtf8FromKeysym(keysym: u32) []const u8 {
-    return switch (keysym) {
+pub fn present(self: *Self) void {
+    if (self.pending_present) |buffer| {
+        c.wl_surface_attach(self.wl_surface, buffer.wl_buffer, 0, 0);
+        c.wl_surface_damage(self.wl_surface, 0, 0, std.math.maxInt(i32), std.math.maxInt(i32));
+        c.wl_surface_commit(self.wl_surface);
+
+        buffer.busy = true;
+        self.pending_present = null;
+    }
+}
+
+fn getUtf8FromKeysym(buf: [:0]u8, keysym: u32) []const u8 {
+    const result = switch (keysym) {
         c.XKB_KEY_dead_grave => "`",
         c.XKB_KEY_dead_acute => "´",
         c.XKB_KEY_dead_circumflex => "^",
@@ -353,34 +357,35 @@ fn getUtf8FromKeysym(keysym: u32) []const u8 {
         c.XKB_KEY_dead_breve => "˘",
         c.XKB_KEY_dead_abovering => "˚",
         c.XKB_KEY_dead_doubleacute => "˝",
-        else => blk: {
-            var tmp: [4096:0]u8 = .{0} ** 4096;
-            _ = c.xkb_keysym_to_utf8(keysym, &tmp, tmp.len);
-            break :blk std.mem.span(@as([*:0]u8, &tmp));
+        else => {
+            _ = c.xkb_keysym_to_utf8(keysym, buf.ptr, buf.len);
+            return std.mem.sliceTo(buf, 0);
         },
     };
+    _ = std.fmt.bufPrintSentinel(buf, "{s}", .{result}, 0) catch 0;
+    return result;
 }
 
 pub fn getTitle(self: *Self) []const u8 {
-    return std.mem.span(@as([*:0]u8, &self.impl.title));
+    return std.mem.span(@as([*:0]u8, &self.title));
 }
 
 pub fn setTitle(self: *Self, title: []const u8) void {
-    const len = @min(title.len, self.impl.title.len - 1);
-    _ = std.fmt.bufPrintSentinel(&self.impl.title, "{s}", .{title[0..len]}, 0) catch unreachable;
-    c.xdg_toplevel_set_title(self.impl.xdg_toplevel, &self.impl.title);
+    const len = @min(title.len, self.title.len - 1);
+    _ = std.fmt.bufPrintSentinel(&self.title, "{s}", .{title[0..len]}, 0) catch unreachable;
+    c.xdg_toplevel_set_title(self.xdg_toplevel, &self.title);
 }
 
 pub fn setFullscreen(self: *Self) void {
-    c.xdg_toplevel_set_fullscreen(self.impl.xdg_toplevel, null);
+    c.xdg_toplevel_set_fullscreen(self.xdg_toplevel, null);
 }
 
 pub fn unsetFullscreen(self: *Self) void {
-    c.xdg_toplevel_unset_fullscreen(self.impl.xdg_toplevel);
+    c.xdg_toplevel_unset_fullscreen(self.xdg_toplevel);
 }
 
 pub fn setBorderless(self: *Self) void {
-    if (self.impl.zxdg_toplevel_decoration_v1) |zxdg_toplevel_decoration_v1| {
+    if (self.zxdg_toplevel_decoration_v1) |zxdg_toplevel_decoration_v1| {
         c.zxdg_toplevel_decoration_v1_set_mode(
             zxdg_toplevel_decoration_v1,
             c.ZXDG_TOPLEVEL_DECORATION_V1_MODE_CLIENT_SIDE,
@@ -391,7 +396,7 @@ pub fn setBorderless(self: *Self) void {
 }
 
 pub fn unsetBorderless(self: *Self) void {
-    if (self.impl.zxdg_toplevel_decoration_v1) |zxdg_toplevel_decoration_v1| {
+    if (self.zxdg_toplevel_decoration_v1) |zxdg_toplevel_decoration_v1| {
         c.zxdg_toplevel_decoration_v1_set_mode(
             zxdg_toplevel_decoration_v1,
             c.ZXDG_TOPLEVEL_DECORATION_V1_MODE_SERVER_SIDE,
@@ -402,55 +407,195 @@ pub fn unsetBorderless(self: *Self) void {
 }
 
 pub fn maximize(self: *Self) void {
-    c.xdg_toplevel_set_maximized(self.impl.xdg_toplevel);
+    c.xdg_toplevel_set_maximized(self.xdg_toplevel);
 }
 
 pub fn restore(self: *Self) void {
-    c.xdg_toplevel_unset_maximized(self.impl.xdg_toplevel);
+    c.xdg_toplevel_unset_maximized(self.xdg_toplevel);
 }
 
 pub fn minimize(self: *Self) void {
-    c.xdg_toplevel_set_minimized(self.impl.xdg_toplevel);
+    c.xdg_toplevel_set_minimized(self.xdg_toplevel);
 }
 
 pub fn getMaxSize(self: *Self) Size {
-    return .{ .width = self.impl.max_width, .height = self.impl.max_height };
+    return .{ .width = self.max_width, .height = self.max_height };
 }
 
 pub fn setMaxSize(self: *Self, width: u32, height: u32) void {
-    c.xdg_toplevel_set_max_size(self.impl.xdg_toplevel, @intCast(width), @intCast(height));
-    self.impl.max_width = width;
-    self.impl.max_height = height;
+    c.xdg_toplevel_set_max_size(self.xdg_toplevel, @intCast(width), @intCast(height));
+    self.max_width = width;
+    self.max_height = height;
 }
 
 pub fn getMinSize(self: *Self) Size {
-    return .{ .width = self.impl.min_width, .height = self.impl.min_height };
+    return .{ .width = self.min_width, .height = self.min_height };
 }
 
 pub fn setMinSize(self: *Self, width: u32, height: u32) void {
-    c.xdg_toplevel_set_min_size(self.impl.xdg_toplevel, @intCast(width), @intCast(height));
-    self.impl.min_width = width;
-    self.impl.min_height = height;
+    c.xdg_toplevel_set_min_size(self.xdg_toplevel, @intCast(width), @intCast(height));
+    self.min_width = width;
+    self.min_height = height;
 }
 
 pub fn getSize(self: *Self) Size {
-    return .{ .width = self.impl.width, .height = self.impl.height };
+    return .{ .width = self.width, .height = self.height };
 }
 
-pub fn getBuffer(self: *Self) []u32 {
-    return self.impl.buffer.?;
+pub fn getBuffer(self: *Self) ?[]u32 {
+    for (&self.buffers) |*buffer| {
+        if (!buffer.busy) {
+            self.pending_present = buffer;
+            return buffer.pixels;
+        }
+    }
+    return null;
+}
+
+pub fn pumpEvents(self: *Self) void {
+    self.events.clear();
+
+    const wayland_fd = c.wl_display_get_fd(self.wl_display);
+    const events_capacity = 32;
+    var wayland_readable: bool = false;
+    var events: [events_capacity]std.os.linux.epoll_event = undefined;
+
+    _ = c.wl_display_dispatch_pending(self.wl_display);
+    while (c.wl_display_prepare_read(self.wl_display) != 0) {
+        _ = c.wl_display_dispatch_pending(self.wl_display);
+    }
+    _ = c.wl_display_flush(self.wl_display);
+
+    const events_len = std.os.linux.epoll_wait(self.epoll_fd, &events, events_capacity, -1);
+    for (events[0..events_len]) |event| {
+        if (event.data.fd == wayland_fd) {
+            wayland_readable = true;
+        } else if (event.data.fd == self.text_input_timer_fd) {
+            var expirations: u64 = undefined;
+            _ = std.os.linux.read(self.text_input_timer_fd, std.mem.asBytes(&expirations), @sizeOf(u64));
+            self.events.put(.{ .keyboard_key_down = .{
+                .key = evdev_to_key[self.keyboard_last_key],
+                .modifiers = self.getKeyboardModifiers(),
+                .raw = self.keyboard_last_key,
+                .repeat = true,
+            } }) catch log.warn("Event queue full, a key down event missed", .{});
+            if (self.text_input_enabled and self.text_input_buf[0] != 0) {
+                self.events.put(.{
+                    .text_input_changed = std.mem.sliceTo(&self.text_input_buf, 0),
+                }) catch {
+                    log.warn("Event queue full, a text input event missed", .{});
+                };
+            }
+            c.xkb_compose_state_reset(self.xkb_compose_state);
+        } else {
+            var event_type: Event.Fd.Type = undefined;
+            if (event.events & std.os.linux.EPOLL.IN == std.os.linux.EPOLL.IN) {
+                event_type = .in;
+            } else if (event.events & std.os.linux.EPOLL.OUT == std.os.linux.EPOLL.OUT) {
+                event_type = .out;
+            } else if (event.events & std.os.linux.EPOLL.ERR == std.os.linux.EPOLL.ERR) {
+                event_type = .err;
+            } else if (event.events & std.os.linux.EPOLL.HUP == std.os.linux.EPOLL.HUP) {
+                event_type = .hup;
+            }
+            self.events.put(.{ .fd = .{
+                .fd = @intCast(event.data.fd),
+                .type = event_type,
+            } }) catch {
+                log.warn("Event queue full, a fd event missed", .{});
+            };
+            if (self.fd_map.get(event.data.fd)) |entry| {
+                entry.callback(entry.user_data, event_type);
+            }
+        }
+    }
+
+    if (wayland_readable) {
+        _ = c.wl_display_read_events(self.wl_display);
+        _ = c.wl_display_dispatch_pending(self.wl_display);
+    } else {
+        _ = c.wl_display_cancel_read(self.wl_display);
+    }
 }
 
 pub fn pollEvent(self: *Self) ?Event {
-    return self.impl.events.get();
+    return self.events.take();
+}
+
+pub const FdEventsFlags = packed struct {
+    in: bool = false,
+    out: bool = false,
+    err: bool = false,
+    hup: bool = false,
+};
+
+pub fn addFdListener(
+    self: *Self,
+    fd: i32,
+    events: FdEventsFlags,
+    callback: ?FdListenerCallback,
+    user_data: ?*anyopaque,
+) error{ InvalidFd, AlreadyRegistered, OutOfMemory }!void {
+    var flags: u32 = 0;
+    if (events.in) flags |= std.os.linux.EPOLL.IN;
+    if (events.out) flags |= std.os.linux.EPOLL.OUT;
+    if (events.err) flags |= std.os.linux.EPOLL.ERR;
+    if (events.hup) flags |= std.os.linux.EPOLL.HUP;
+
+    var event: std.os.linux.epoll_event = .{
+        .data = .{ .fd = fd },
+        .events = flags,
+    };
+
+    const ok = std.os.linux.epoll_ctl(self.epoll_fd, std.os.linux.EPOLL.CTL_ADD, fd, &event);
+    switch (std.os.linux.errno(ok)) {
+        .SUCCESS => {},
+        .EXIST => return error.AlreadyRegistered,
+        else => return error.InvalidFd,
+    }
+
+    if (callback) |cb| {
+        try self.fd_map.put(fd, .{ .callback = cb, .user_data = user_data });
+    }
+}
+
+pub fn modifyFdListener(self: *Self, fd: i32, events: FdEventsFlags) error{ InvalidFd, NotRegistered }!void {
+    var flags: u32 = 0;
+    if (events.in) flags |= std.os.linux.EPOLL.IN;
+    if (events.out) flags |= std.os.linux.EPOLL.OUT;
+    if (events.err) flags |= std.os.linux.EPOLL.ERR;
+    if (events.hup) flags |= std.os.linux.EPOLL.HUP;
+
+    var event: std.os.linux.epoll_event = .{
+        .data = .{ .fd = fd },
+        .events = flags,
+    };
+
+    const ok = std.os.linux.epoll_ctl(self.epoll_fd, std.os.linux.EPOLL.CTL_MOD, fd, &event);
+    switch (std.os.linux.errno(ok)) {
+        .SUCCESS => {},
+        .NOENT => return error.NotRegistered,
+        else => return error.InvalidFd,
+    }
+}
+
+pub fn removeFdListener(self: *Self, fd: i32) error{ InvalidFd, NotRegistered }!void {
+    const ok = std.os.linux.epoll_ctl(self.epoll_fd, std.os.linux.EPOLL.CTL_DEL, fd, null);
+    switch (std.os.linux.errno(ok)) {
+        .SUCCESS => {},
+        .NOENT => return error.NotRegistered,
+        else => return error.InvalidFd,
+    }
+
+    _ = self.fd_map.remove(fd);
 }
 
 pub fn setPointerShape(self: *Self, shape: Shape) void {
-    if (self.impl.wp_cursor_shape_device_v1) |wp_cursor_shape_device_v1| {
-        self.impl.pointer_shape = shape;
+    if (self.wp_cursor_shape_device_v1) |wp_cursor_shape_device_v1| {
+        self.pointer_shape = shape;
         c.wp_cursor_shape_device_v1_set_shape(
             wp_cursor_shape_device_v1,
-            self.impl.pointer_serial,
+            self.pointer_serial,
             @intFromEnum(shape),
         );
     } else {
@@ -459,26 +604,36 @@ pub fn setPointerShape(self: *Self, shape: Shape) void {
 }
 
 pub fn buttonIsPressed(self: *Self, button: Button) bool {
-    _ = self;
-    _ = button;
-    log.err("Not Implemented", .{});
-    unreachable;
+    return self.pointer_self[@intFromEnum(button)];
 }
 
 pub fn keyIsPressed(self: *Self, key: Key) bool {
-    return self.impl.keyboard_state[@intFromEnum(key)];
+    return self.keyboard_self[@intFromEnum(key)];
 }
 
-pub fn getModifiers(self: *Self) Modifiers {
-    return makeModifiers(self.impl);
+pub fn enableKeyboardRepeat(self: *Self) void {
+    self.keyboard_repeat_mode = true;
 }
 
-pub fn textInputEnable(self: *Self) void {
-    self.impl.text_input_enabled = true;
+pub fn disableKeyboardRepeat(self: *Self) void {
+    self.keyboard_repeat_mode = false;
 }
 
-pub fn textInputDisable(self: *Self) void {
-    self.impl.text_input_enabled = false;
+pub fn setKeyboardRepeatRateAndDelay(self: *Self, rate: u32, delay: u32) void {
+    self.keyboard_repeat_rate = rate;
+    self.keyboard_repeat_delay = delay;
+}
+
+pub fn getKeyboardModifiers(self: *Self) Modifiers {
+    return makeModifiers(self);
+}
+
+pub fn enableTextInput(self: *Self) void {
+    self.text_input_enabled = true;
+}
+
+pub fn disableTextInput(self: *Self) void {
+    self.text_input_enabled = false;
 }
 
 fn wlRegistryGlobal(
@@ -489,33 +644,37 @@ fn wlRegistryGlobal(
     version: u32,
 ) callconv(.c) void {
     _ = version;
-    const impl: *Impl = @ptrCast(@alignCast(user_data));
+    const self: *Self = @ptrCast(@alignCast(user_data));
+    var logging: bool = false;
     if (std.mem.eql(u8, std.mem.span(interface), std.mem.span(c.wl_compositor_interface.name))) {
-        impl.wl_compositor = @ptrCast(
+        self.wl_compositor = @ptrCast(
             @alignCast(c.wl_registry_bind(wl_registry, name, &c.wl_compositor_interface, 6)),
         );
+        logging = true;
     } else if (std.mem.eql(u8, std.mem.span(interface), std.mem.span(c.xdg_wm_base_interface.name))) {
-        impl.xdg_wm_base = @ptrCast(
+        self.xdg_wm_base = @ptrCast(
             @alignCast(c.wl_registry_bind(wl_registry, name, &c.xdg_wm_base_interface, 1)),
         );
-    }
-    if (std.mem.eql(u8, std.mem.span(interface), std.mem.span(c.wl_shm_interface.name))) {
-        impl.wl_shm = @ptrCast(@alignCast(c.wl_registry_bind(wl_registry, name, &c.wl_shm_interface, 1)));
-        return;
-    }
-    if (std.mem.eql(u8, std.mem.span(interface), std.mem.span(c.wl_seat_interface.name))) {
-        impl.wl_seat = @ptrCast(@alignCast(c.wl_registry_bind(wl_registry, name, &c.wl_seat_interface, 9)));
-        return;
-    }
-    if (std.mem.eql(u8, std.mem.span(interface), std.mem.span(c.wp_cursor_shape_manager_v1_interface.name))) {
-        impl.wp_cursor_shape_manager_v1 = @ptrCast(
+        logging = true;
+    } else if (std.mem.eql(u8, std.mem.span(interface), std.mem.span(c.wl_shm_interface.name))) {
+        self.wl_shm = @ptrCast(@alignCast(c.wl_registry_bind(wl_registry, name, &c.wl_shm_interface, 1)));
+        logging = true;
+    } else if (std.mem.eql(u8, std.mem.span(interface), std.mem.span(c.wl_seat_interface.name))) {
+        self.wl_seat = @ptrCast(@alignCast(c.wl_registry_bind(wl_registry, name, &c.wl_seat_interface, 9)));
+        logging = true;
+    } else if (std.mem.eql(u8, std.mem.span(interface), std.mem.span(c.wp_cursor_shape_manager_v1_interface.name))) {
+        self.wp_cursor_shape_manager_v1 = @ptrCast(
             @alignCast(c.wl_registry_bind(wl_registry, name, &c.wp_cursor_shape_manager_v1_interface, 1)),
         );
-    }
-    if (std.mem.eql(u8, std.mem.span(interface), std.mem.span(c.zxdg_decoration_manager_v1_interface.name))) {
-        impl.zxdg_decoration_manager_v1 = @ptrCast(
+        logging = true;
+    } else if (std.mem.eql(u8, std.mem.span(interface), std.mem.span(c.zxdg_decoration_manager_v1_interface.name))) {
+        self.zxdg_decoration_manager_v1 = @ptrCast(
             @alignCast(c.wl_registry_bind(wl_registry, name, &c.zxdg_decoration_manager_v1_interface, 1)),
         );
+        logging = true;
+    }
+    if (logging) {
+        log.debug("wlRegistryGlobal binding {s}", .{interface});
     }
 }
 
@@ -528,25 +687,28 @@ fn wlRegistryGlobalRemove(user_data: ?*anyopaque, wl_registry: ?*c.wl_registry, 
 fn xdgWmBasePing(user_data: ?*anyopaque, wm_base: ?*c.xdg_wm_base, serial: u32) callconv(.c) void {
     _ = user_data;
     c.xdg_wm_base_pong(wm_base, serial);
+    log.debug("xdgWmBasePing", .{});
 }
 
 fn wlSeatCapabilities(user_data: ?*anyopaque, wl_seat: ?*c.wl_seat, capabilities: u32) callconv(.c) void {
-    const impl: *Impl = @ptrCast(@alignCast(user_data));
+    const self: *Self = @ptrCast(@alignCast(user_data));
     if (capabilities & c.WL_SEAT_CAPABILITY_KEYBOARD == c.WL_SEAT_CAPABILITY_KEYBOARD) {
-        impl.wl_keyboard = c.wl_seat_get_keyboard(wl_seat);
-        _ = c.wl_keyboard_add_listener(impl.wl_keyboard, &wl_keyboard_listener, impl);
+        self.wl_keyboard = c.wl_seat_get_keyboard(wl_seat);
+        _ = c.wl_keyboard_add_listener(self.wl_keyboard, &wl_keyboard_listener, self);
+        log.debug("xdgSeatCapabilities set keyboard capabilities", .{});
     }
     if (capabilities & c.WL_SEAT_CAPABILITY_POINTER == c.WL_SEAT_CAPABILITY_POINTER) {
         const wl_pointer = c.wl_seat_get_pointer(wl_seat);
-        impl.wl_pointer = wl_pointer;
-        _ = c.wl_pointer_add_listener(wl_pointer, &wl_pointer_listener, impl);
-        if (impl.wp_cursor_shape_manager_v1) |wp_cursor_shape_manager_v1| {
+        self.wl_pointer = wl_pointer;
+        _ = c.wl_pointer_add_listener(wl_pointer, &wl_pointer_listener, self);
+        if (self.wp_cursor_shape_manager_v1) |wp_cursor_shape_manager_v1| {
             const wp_cursor_shape_device_v1 = c.wp_cursor_shape_manager_v1_get_pointer(
                 wp_cursor_shape_manager_v1,
                 wl_pointer,
             );
-            impl.wp_cursor_shape_device_v1 = wp_cursor_shape_device_v1;
+            self.wp_cursor_shape_device_v1 = wp_cursor_shape_device_v1;
         }
+        log.debug("xdgSeatCapabilities set pointer capabilities", .{});
     }
 }
 
@@ -557,75 +719,89 @@ fn wlSeatName(user_data: ?*anyopaque, wl_seat: ?*c.wl_seat, name: [*c]const u8) 
 }
 
 fn xdgSurfaceConfigure(user_data: ?*anyopaque, xdg_surface: ?*c.xdg_surface, serial: u32) callconv(.c) void {
-    const impl: *Impl = @ptrCast(@alignCast(user_data));
+    const self: *Self = @ptrCast(@alignCast(user_data));
     c.xdg_surface_ack_configure(xdg_surface, serial);
-    if (impl.resized) {
-        impl.events.put(
-            .{ .window_resized = .{
-                .width = impl.width,
-                .height = impl.height,
-            } },
-        ) catch {
-            log.warn("Event queue full, a resizing event missed", .{});
-        };
-        impl.resized = false;
-        configureWlShmPool(impl);
+    if (self.wl_shm_pool == null) {
+        createBuffers(self);
+        self.buffers[0].busy = true;
+        c.wl_surface_attach(self.wl_surface, self.buffers[0].wl_buffer, 0, 0);
+        c.wl_surface_damage(self.wl_surface, 0, 0, std.math.maxInt(i32), std.math.maxInt(i32));
+        c.wl_surface_commit(self.wl_surface);
+    } else if (self.resize_pending) {
+        self.events.put(
+            .{
+                .window_resized = .{
+                    .width = self.width,
+                    .height = self.height,
+                },
+            },
+        ) catch log.warn("Event queue full, a resizing event missed", .{});
+        createBuffers(self);
+        self.resize_pending = false;
     }
-    if (!impl.started) {
-        drawFrame(impl);
-        c.wl_surface_commit(impl.wl_surface);
-        impl.started = true;
-    }
+    log.debug("xdgSurfaceConfigure", .{});
 }
 
-fn drawFrame(impl: *Impl) void {
-    impl.wl_buffer = c.wl_shm_pool_create_buffer(
-        impl.wl_shm_pool,
-        0,
-        @intCast(impl.width),
-        @intCast(impl.height),
-        @intCast(impl.width * 4),
-        c.WL_SHM_FORMAT_ARGB8888,
-    );
-    _ = c.wl_buffer_add_listener(impl.wl_buffer, &wl_buffer_listener, impl);
-    c.wl_surface_attach(impl.wl_surface, impl.wl_buffer, 0, 0);
-    c.wl_surface_damage(impl.wl_surface, 0, 0, std.math.maxInt(i32), std.math.maxInt(i32));
-}
-
-fn configureWlShmPool(impl: *Impl) void {
-    if (impl.buffer) |buffer| {
-        _ = std.os.linux.munmap(@ptrCast(buffer.ptr), buffer.len);
-    }
-    const width: i32, const height: i32 = .{ @intCast(impl.width), @intCast(impl.height) };
+fn createBuffers(self: *Self) void {
+    const width: i32, const height: i32 = .{ @intCast(self.width), @intCast(self.height) };
     const stride = width * 4;
-    const size = stride * height;
-    const fd: i32 = @intCast(std.os.linux.memfd_create("/wl_shm", 0));
-    defer _ = std.os.linux.close(fd);
-    _ = std.os.linux.ftruncate(fd, size);
-    const map = std.os.linux.mmap(
-        null,
-        @intCast(size),
-        .{ .READ = true, .WRITE = true },
-        std.os.linux.MAP{ .TYPE = .SHARED },
-        fd,
-        0,
-    );
-    const len: usize = @intCast(width * height);
-    impl.buffer = @as([*]u32, @ptrFromInt(map))[0..len];
-    const clear_color: u32 = 0xFF000000;
-    @memset(impl.buffer.?, @bitCast(clear_color));
-    if (impl.wl_shm_pool) |wl_shm_pool| {
-        c.wl_shm_pool_destroy(wl_shm_pool);
+    const size = stride * height * buffers_len;
+
+    if (self.wl_shm_pool_size < size or self.wl_shm_pool == null) {
+        cleanup(c.wl_shm_pool_destroy, &self.wl_shm_pool, .{});
+        if (self.pixels) |*pixels| {
+            _ = std.os.linux.munmap(@ptrCast(pixels.ptr), pixels.len);
+        }
+
+        const memfd_create_flags = std.os.linux.MFD.CLOEXEC | std.os.linux.MFD.ALLOW_SEALING;
+        const fd: i32 = @intCast(std.os.linux.memfd_create("/wl_shm", memfd_create_flags));
+        defer _ = std.os.linux.close(fd);
+        std.debug.assert(fd != 0);
+        const fcntl_flags = std.os.linux.F.SEAL_SHRINK | std.os.linux.F.SEAL_SEAL;
+        std.debug.assert(std.os.linux.fcntl(fd, std.os.linux.F.ADD_SEALS, fcntl_flags) != -1);
+
+        _ = std.os.linux.ftruncate(fd, size);
+        const map = std.os.linux.mmap(
+            null,
+            @intCast(size),
+            .{ .READ = true, .WRITE = true },
+            std.os.linux.MAP{ .TYPE = .SHARED },
+            fd,
+            0,
+        );
+        const len: usize = @intCast(width * height * buffers_len);
+        self.pixels = @as([*]u32, @ptrFromInt(map))[0..len];
+
+        self.wl_shm_pool = c.wl_shm_create_pool(self.wl_shm, fd, size);
+
+        self.wl_shm_pool_size = @intCast(size);
     }
-    impl.wl_shm_pool = c.wl_shm_create_pool(impl.wl_shm, fd, size);
+
+    for (0..buffers_len) |i| {
+        cleanup(c.wl_buffer_destroy, &self.buffers[i].wl_buffer, .{});
+        self.buffers[i] = .{
+            .wl_buffer = c.wl_shm_pool_create_buffer(
+                self.wl_shm_pool,
+                stride * height * @as(i32, @intCast(i)),
+                width,
+                height,
+                stride,
+                c.WL_SHM_FORMAT_ARGB8888,
+            ),
+            .pixels = self.pixels.?[@intCast(width * height * @as(i32, @intCast(i)))..],
+            .busy = false,
+        };
+        _ = c.wl_buffer_add_listener(self.buffers[i].wl_buffer, &wl_buffer_listener, &self.buffers[i]);
+    }
 }
 
 fn xdgToplevelClose(user_data: ?*anyopaque, toplevel: ?*c.xdg_toplevel) callconv(.c) void {
     _ = toplevel;
-    const impl: *Impl = @ptrCast(@alignCast(user_data));
-    impl.events.put(.{ .window_close_requested = {} }) catch {
+    const self: *Self = @ptrCast(@alignCast(user_data));
+    self.events.put(.{ .window_close_requested = {} }) catch {
         log.warn("Event queue full, event closing missed", .{});
     };
+    log.debug("xdgToplevelClose", .{});
 }
 
 fn xdgToplevelConfigure(
@@ -633,15 +809,15 @@ fn xdgToplevelConfigure(
     toplevel: ?*c.xdg_toplevel,
     width: i32,
     height: i32,
-    states: [*c]c.wl_array,
+    selfs: [*c]c.wl_array,
 ) callconv(.c) void {
     _ = toplevel;
-    _ = states;
-    const impl: *Impl = @ptrCast(@alignCast(user_data));
-    if ((width != 0 and height != 0) and (impl.width != width or impl.height != height)) {
-        impl.resized = true;
-        impl.width = @intCast(width);
-        impl.height = @intCast(height);
+    _ = selfs;
+    const self: *Self = @ptrCast(@alignCast(user_data));
+    if ((width != 0 and height != 0) and (self.width != width or self.height != height)) {
+        self.resize_pending = true;
+        self.width = @intCast(width);
+        self.height = @intCast(height);
     }
 }
 
@@ -667,26 +843,10 @@ fn xdgToplevelWmCapabilities(
     _ = user_data;
 }
 
-fn wlCallbackDone(user_data: ?*anyopaque, wl_callback: ?*c.wl_callback, time: u32) callconv(.c) void {
-    _ = time;
-    const impl: *Impl = @ptrCast(@alignCast(user_data));
-
-    c.wl_callback_destroy(wl_callback);
-    const new_wl_callback = c.wl_surface_frame(impl.wl_surface);
-    impl.wl_callback = new_wl_callback;
-    _ = c.wl_callback_add_listener(new_wl_callback, &wl_callback_listener, impl);
-
-    drawFrame(impl);
-    c.wl_surface_commit(impl.wl_surface);
-    impl.presented = true;
-}
-
 fn wlBufferRelease(user_data: ?*anyopaque, wl_buffer: ?*c.wl_buffer) callconv(.c) void {
-    const impl: *Impl = @ptrCast(@alignCast(user_data));
-    if (wl_buffer == impl.wl_buffer) {
-        impl.wl_buffer = null;
-    }
-    c.wl_buffer_destroy(wl_buffer);
+    _ = wl_buffer;
+    const buffer: *Buffer = @ptrCast(@alignCast(user_data));
+    buffer.busy = false;
 }
 
 pub fn wlKeyboardEnter(
@@ -699,21 +859,17 @@ pub fn wlKeyboardEnter(
     _ = wl_keyboard;
     _ = serial;
     _ = wl_surface;
-    const impl: *Impl = @ptrCast(@alignCast(user_data));
+    const self: *Self = @ptrCast(@alignCast(user_data));
     const arr_evdev_keys = @as([*]u32, @ptrCast(@alignCast(evdev_keys.?.data)))[0..evdev_keys.?.size];
     for (arr_evdev_keys) |evdev_key| {
         const key = evdev_to_key[if (evdev_key < evdev_key_max) evdev_key else 0];
-        impl.keyboard_state[@intFromEnum(key)] = true;
-        impl.events.put(.{
-            .key_down = .{
-                .key = key,
-                .modifiers = makeModifiers(impl),
-                .raw = evdev_key,
-            },
-        }) catch {
-            log.warn("Event queue full, key down event missed", .{});
-        };
+        self.keyboard_self[@intFromEnum(key)] = true;
     }
+    self.events.put(.{
+        .keyboard_focus = .{ .focus = true },
+    }) catch {
+        log.warn("Event Queue is full, keyboard focus event missed", .{});
+    };
 }
 
 pub fn wlKeyboardLeave(
@@ -725,8 +881,14 @@ pub fn wlKeyboardLeave(
     _ = wl_keyboard;
     _ = serial;
     _ = wl_surface;
-    const impl: *Impl = @ptrCast(@alignCast(user_data));
-    impl.keyboard_state = .{false} ** keyboard_state_len;
+    const self: *Self = @ptrCast(@alignCast(user_data));
+    self.keyboard_self = .{false} ** keyboard_self_len;
+    unsetTextInputTimer(self);
+    self.events.put(.{
+        .keyboard_focus = .{ .focus = false },
+    }) catch {
+        log.warn("Event Queue is full, keyboard focus event missed", .{});
+    };
 }
 
 pub fn wlKeyboardKey(
@@ -735,127 +897,157 @@ pub fn wlKeyboardKey(
     serial: u32,
     time: u32,
     evdev_key: u32,
-    state: u32,
+    keyboard_self: u32,
 ) callconv(.c) void {
     _ = wl_keyboard;
     _ = serial;
     _ = time;
-    const impl: *Impl = @ptrCast(@alignCast(user_data));
-    const modifiers = makeModifiers(impl);
+    const self: *Self = @ptrCast(@alignCast(user_data));
+    const modifiers = makeModifiers(self);
     const key = evdev_to_key[evdev_key];
-    switch (state) {
+    switch (keyboard_self) {
         c.WL_KEYBOARD_KEY_STATE_PRESSED => {
-            _ = c.xkb_state_update_key(impl.xkb_state, evdev_key + 8, c.XKB_KEY_DOWN);
-            impl.events.put(.{
-                .key_down = .{
+            if (self.keyboard_repeat_mode and self.keyboard_repeat_rate > 0) {
+                setTextInputTimer(self);
+            }
+            _ = c.xkb_state_update_key(self.xkb_state, evdev_key + 8, c.XKB_KEY_DOWN);
+            self.keyboard_last_key = evdev_key;
+            self.events.put(.{
+                .keyboard_key_down = .{
                     .key = key,
+                    .repeat = false,
                     .modifiers = modifiers,
                     .raw = evdev_key,
                 },
             }) catch {
                 log.warn("Event Queue is full, key down event missed", .{});
             };
-            impl.keyboard_state[@intFromEnum(key)] = true;
-        },
-        c.WL_KEYBOARD_KEY_STATE_RELEASED => {
-            _ = c.xkb_state_update_key(impl.xkb_state, evdev_key + 8, c.XKB_KEY_UP);
-            impl.events.put(.{
-                .key_up = .{
-                    .key = key,
-                    .modifiers = modifiers,
-                    .raw = evdev_key,
-                },
-            }) catch {
-                log.warn("Event Queue is full, key up event missed", .{});
-            };
-            impl.keyboard_state[@intFromEnum(key)] = false;
-        },
-        else => {},
-    }
-    if (!impl.text_input_enabled) return;
-    switch (state) {
-        c.WL_KEYBOARD_KEY_STATE_PRESSED => {
-            _ = c.xkb_state_update_key(impl.xkb_state, evdev_key + 8, c.XKB_KEY_DOWN);
-            const keysym = c.xkb_state_key_get_one_sym(impl.xkb_state, evdev_key + 8);
-            const result = c.xkb_compose_state_feed(impl.xkb_compose_state, keysym);
-            if (result == 0) return;
-            var tmp: [4096:0]u8 = .{0} ** 4096;
-            switch (c.xkb_compose_state_get_status(impl.xkb_compose_state)) {
+            self.keyboard_self[@intFromEnum(key)] = true;
+
+            if (!self.text_input_enabled) return;
+
+            const keysym = c.xkb_state_key_get_one_sym(self.xkb_state, evdev_key + 8);
+            const result = c.xkb_compose_state_feed(self.xkb_compose_state, keysym);
+            if (result == 0) {
+                self.text_input_buf = .{0} ** text_input_buf_len;
+                return;
+            }
+
+            switch (c.xkb_compose_state_get_status(self.xkb_compose_state)) {
                 c.XKB_COMPOSE_COMPOSED => {
-                    if (c.xkb_compose_state_get_utf8(impl.xkb_compose_state, &tmp, tmp.len) > 0) {
-                        impl.text_input_last_keysym = keysym;
-                        impl.text_input_state = .pressed;
-                        impl.events.put(.{ .text_input_changed = std.mem.span(@as([*:0]u8, &tmp)) }) catch {
+                    if (c.xkb_compose_state_get_utf8(self.xkb_compose_state, &self.text_input_buf, self.text_input_buf.len) > 0) {
+                        self.events.put(.{ .text_input_changed = std.mem.sliceTo(&self.text_input_buf, 0) }) catch {
                             log.warn("Event queue full, a text input event missed", .{});
                         };
                     }
-                    impl.text_input_preedit = .{0} ** 4096;
                 },
                 c.XKB_COMPOSE_NOTHING => {
-                    if (c.xkb_state_key_get_utf8(impl.xkb_state, evdev_key + 8, &tmp, tmp.len) > 0) {
-                        impl.text_input_last_keysym = keysym;
-                        impl.text_input_state = .pressed;
-                        impl.events.put(.{ .text_input_changed = std.mem.span(@as([*:0]u8, &tmp)) }) catch {
+                    if (c.xkb_state_key_get_utf8(self.xkb_state, evdev_key + 8, &self.text_input_buf, self.text_input_buf.len) > 0) {
+                        self.events.put(.{ .text_input_changed = std.mem.sliceTo(&self.text_input_buf, 0) }) catch {
                             log.warn("Event queue full, a text input event missed", .{});
                         };
                     }
                 },
                 c.XKB_COMPOSE_COMPOSING => {
-                    impl.text_input_last_keysym = keysym;
-                    impl.text_input_state = .pressed;
-                    const current = std.mem.span(@as([*:0]u8, &impl.text_input_preedit));
-                    const preedit = std.fmt.bufPrintSentinel(&tmp, "{s}{s}", .{ current, getUtf8FromKeysym(keysym) }, 0) catch "";
-                    impl.text_input_preedit = tmp;
-                    impl.events.put(.{ .text_input_preedit_changed = preedit }) catch {
+                    _ = getUtf8FromKeysym(&self.text_input_buf, keysym);
+                    self.events.put(.{ .text_input_preedit_changed = std.mem.sliceTo(&self.text_input_buf, 0) }) catch {
                         log.warn("Event queue full, a text input event missed", .{});
                     };
                 },
                 c.XKB_COMPOSE_CANCELLED => {
-                    impl.text_input_preedit = .{0} ** 4096;
-                    impl.events.put(.{ .text_input_preedit_changed = "" }) catch {
+                    self.events.put(.{ .text_input_preedit_cancel = {} }) catch {
                         log.warn("Event queue full, a text input event missed", .{});
                     };
+                    self.text_input_buf = .{0} ** text_input_buf_len;
                 },
                 else => {},
             }
         },
         c.WL_KEYBOARD_KEY_STATE_RELEASED => {
-            _ = c.xkb_state_update_key(impl.xkb_state, evdev_key + 8, c.XKB_KEY_UP);
-            impl.text_input_state = .none;
+            if (self.keyboard_repeat_mode and self.keyboard_repeat_rate > 0) {
+                unsetTextInputTimer(self);
+            }
+            _ = c.xkb_state_update_key(self.xkb_state, evdev_key + 8, c.XKB_KEY_UP);
+            self.events.put(.{
+                .keyboard_key_up = .{
+                    .key = key,
+                    .modifiers = modifiers,
+                    .repeat = false,
+                    .raw = evdev_key,
+                },
+            }) catch {
+                log.warn("Event Queue is full, key up event missed", .{});
+            };
+            self.keyboard_self[@intFromEnum(key)] = false;
+
+            if (!self.text_input_enabled) return;
         },
         else => {},
     }
 }
 
-fn makeModifiers(impl: *Impl) Modifiers {
+fn setTextInputTimer(self: *Self) void {
+    const delay_ns = self.keyboard_repeat_delay * std.time.ns_per_ms;
+    const interval_ns = std.time.ns_per_s / self.keyboard_repeat_rate;
+
+    const timer_spec = std.os.linux.itimerspec{
+        .it_value = .{
+            .sec = @intCast(delay_ns / std.time.ns_per_s),
+            .nsec = @intCast(delay_ns % std.time.ns_per_s),
+        },
+        .it_interval = .{
+            .sec = @intCast(interval_ns / std.time.ns_per_s),
+            .nsec = @intCast(interval_ns % std.time.ns_per_s),
+        },
+    };
+    const ok = std.os.linux.timerfd_settime(
+        self.text_input_timer_fd,
+        std.os.linux.TFD.TIMER{},
+        &timer_spec,
+        null,
+    );
+    std.debug.assert(ok != -1);
+}
+
+fn unsetTextInputTimer(self: *Self) void {
+    const ok = std.os.linux.timerfd_settime(
+        self.text_input_timer_fd,
+        std.os.linux.TFD.TIMER{},
+        &std.mem.zeroes(std.os.linux.itimerspec),
+        null,
+    );
+    std.debug.assert(ok != -1);
+}
+
+fn makeModifiers(self: *Self) Modifiers {
     return .{
         .caps_lock = c.xkb_state_mod_name_is_active(
-            impl.xkb_state,
+            self.xkb_state,
             c.XKB_MOD_NAME_CAPS,
             c.XKB_STATE_MODS_LOCKED,
         ) != 0,
         .num_lock = c.xkb_state_mod_name_is_active(
-            impl.xkb_state,
+            self.xkb_state,
             c.XKB_MOD_NAME_NUM,
             c.XKB_STATE_MODS_LOCKED,
         ) != 0,
         .shift = c.xkb_state_mod_name_is_active(
-            impl.xkb_state,
+            self.xkb_state,
             c.XKB_MOD_NAME_SHIFT,
             c.XKB_STATE_MODS_EFFECTIVE,
         ) != 0,
         .control = c.xkb_state_mod_name_is_active(
-            impl.xkb_state,
+            self.xkb_state,
             c.XKB_MOD_NAME_CTRL,
             c.XKB_STATE_MODS_EFFECTIVE,
         ) != 0,
         .alt = c.xkb_state_mod_name_is_active(
-            impl.xkb_state,
+            self.xkb_state,
             c.XKB_MOD_NAME_ALT,
             c.XKB_STATE_MODS_EFFECTIVE,
         ) != 0,
         .super = c.xkb_state_mod_name_is_active(
-            impl.xkb_state,
+            self.xkb_state,
             c.XKB_MOD_NAME_LOGO,
             c.XKB_STATE_MODS_EFFECTIVE,
         ) != 0,
@@ -873,8 +1065,8 @@ pub fn wlKeyboardModifiers(
 ) callconv(.c) void {
     _ = serial;
     _ = keyboard;
-    const impl: *Impl = @ptrCast(@alignCast(user_data));
-    _ = c.xkb_state_update_mask(impl.xkb_state, mods_depressed, mods_latched, mods_locked, 0, 0, group);
+    const self: *Self = @ptrCast(@alignCast(user_data));
+    _ = c.xkb_state_update_mask(self.xkb_state, mods_depressed, mods_latched, mods_locked, 0, 0, group);
 }
 
 pub fn wlKeyboardKeymap(
@@ -886,28 +1078,28 @@ pub fn wlKeyboardKeymap(
 ) callconv(.c) void {
     _ = keyboard;
     _ = format;
-    const impl: *Impl = @ptrCast(@alignCast(user_data.?));
+    const self: *Self = @ptrCast(@alignCast(user_data.?));
     const map_shm: [*:0]u8 = @ptrFromInt(
         std.os.linux.mmap(null, size, .{ .READ = true }, .{ .TYPE = .PRIVATE }, fd, 0),
     );
     defer _ = std.os.linux.munmap(map_shm, size);
     defer _ = std.os.linux.close(fd);
-    if (impl.xkb_keymap) |xkb_keymap| {
+    if (self.xkb_keymap) |xkb_keymap| {
         c.xkb_keymap_unref(xkb_keymap);
     }
     const xkb_keymap = c.xkb_keymap_new_from_string(
-        impl.xkb_context,
+        self.xkb_context,
         map_shm,
         c.XKB_KEYMAP_FORMAT_TEXT_V1,
         c.XKB_KEYMAP_COMPILE_NO_FLAGS,
     );
-    impl.xkb_keymap = xkb_keymap;
+    self.xkb_keymap = xkb_keymap;
 
-    if (impl.xkb_state) |xkb_state| {
+    if (self.xkb_state) |xkb_state| {
         c.xkb_state_unref(xkb_state);
     }
     const xkb_state = c.xkb_state_new(xkb_keymap).?;
-    impl.xkb_state = xkb_state;
+    self.xkb_state = xkb_state;
 }
 
 fn wlKeyboardRepeatInfo(
@@ -917,9 +1109,9 @@ fn wlKeyboardRepeatInfo(
     delay: i32,
 ) callconv(.c) void {
     _ = wl_keyboard;
-    const impl: *Impl = @ptrCast(@alignCast(user_data.?));
-    impl.text_input_rate = @intCast(rate);
-    impl.text_input_delay = @intCast(delay);
+    const self: *Self = @ptrCast(@alignCast(user_data.?));
+    self.keyboard_repeat_rate = @intCast(rate);
+    self.keyboard_repeat_delay = @intCast(delay);
 }
 
 fn wlPointerEnter(
@@ -932,17 +1124,17 @@ fn wlPointerEnter(
 ) callconv(.c) void {
     _ = wl_pointer;
     _ = wl_surface;
-    const impl: *Impl = @ptrCast(@alignCast(data));
-    impl.pointer_serial = serial;
-    impl.pointer_position_changed = true;
-    impl.pointer_position_x = @intCast(c.wl_fixed_to_int(surface_x));
-    impl.pointer_position_y = @intCast(c.wl_fixed_to_int(surface_y));
+    const self: *Self = @ptrCast(@alignCast(data));
+    self.pointer_serial = serial;
+    self.pointer_position_changed = true;
+    self.pointer_position_x = @intCast(c.wl_fixed_to_int(surface_x));
+    self.pointer_position_y = @intCast(c.wl_fixed_to_int(surface_y));
 
-    if (impl.wp_cursor_shape_device_v1) |wp_cursor_shape_device_v1| {
+    if (self.wp_cursor_shape_device_v1) |wp_cursor_shape_device_v1| {
         c.wp_cursor_shape_device_v1_set_shape(
             wp_cursor_shape_device_v1,
             serial,
-            @intFromEnum(impl.pointer_shape),
+            @intFromEnum(self.pointer_shape),
         );
     }
 }
@@ -953,10 +1145,11 @@ fn wlPointerLeave(
     serial: u32,
     wl_surface: ?*c.wl_surface,
 ) callconv(.c) void {
-    _ = data;
     _ = wl_pointer;
     _ = serial;
     _ = wl_surface;
+    const self: *Self = @ptrCast(@alignCast(data));
+    self.pointer_self = [_]bool{false} ** pointer_self_len;
 }
 
 fn wlPointerMotion(
@@ -968,10 +1161,10 @@ fn wlPointerMotion(
 ) callconv(.c) void {
     _ = wl_pointer;
     _ = serial;
-    const impl: *Impl = @ptrCast(@alignCast(data));
-    impl.pointer_position_changed = true;
-    impl.pointer_position_x = @intCast(c.wl_fixed_to_int(surface_x));
-    impl.pointer_position_y = @intCast(c.wl_fixed_to_int(surface_y));
+    const self: *Self = @ptrCast(@alignCast(data));
+    self.pointer_position_changed = true;
+    self.pointer_position_x = @intCast(c.wl_fixed_to_int(surface_x));
+    self.pointer_position_y = @intCast(c.wl_fixed_to_int(surface_y));
 }
 
 fn wlPointerButton(
@@ -980,12 +1173,12 @@ fn wlPointerButton(
     serial: u32,
     time: u32,
     button: u32,
-    state: u32,
+    pointer_self: u32,
 ) callconv(.c) void {
     _ = serial;
     _ = time;
     _ = wl_pointer;
-    const impl: *Impl = @ptrCast(@alignCast(data));
+    const self: *Self = @ptrCast(@alignCast(data));
     const mapped_button: Button = switch (button) {
         c.BTN_LEFT => .left,
         c.BTN_RIGHT => .right,
@@ -997,9 +1190,9 @@ fn wlPointerButton(
         c.BTN_TASK => .task,
         else => unreachable,
     };
-    if (state == c.WL_POINTER_BUTTON_STATE_PRESSED) {
-        impl.pointer_state[@intFromEnum(mapped_button)] = true;
-        impl.events.put(.{ .pointer_button_down = .{
+    if (pointer_self == c.WL_POINTER_BUTTON_STATE_PRESSED) {
+        self.pointer_self[@intFromEnum(mapped_button)] = true;
+        self.events.put(.{ .pointer_button_down = .{
             .button = mapped_button,
             .raw = button,
         } }) catch {
@@ -1007,8 +1200,8 @@ fn wlPointerButton(
         };
         return;
     }
-    impl.pointer_state[@intFromEnum(mapped_button)] = false;
-    impl.events.put(.{ .pointer_button_up = .{
+    self.pointer_self[@intFromEnum(mapped_button)] = false;
+    self.events.put(.{ .pointer_button_up = .{
         .button = mapped_button,
         .raw = button,
     } }) catch {
@@ -1032,26 +1225,26 @@ fn wlPointerAxis(
 
 fn wlPointerFrame(data: ?*anyopaque, wl_pointer: ?*c.wl_pointer) callconv(.c) void {
     _ = wl_pointer;
-    const impl: *Impl = @ptrCast(@alignCast(data));
-    if (impl.pointer_position_changed) {
-        impl.events.put(.{ .pointer_motion = .{
-            .x = impl.pointer_position_x,
-            .y = impl.pointer_position_y,
+    const self: *Self = @ptrCast(@alignCast(data));
+    if (self.pointer_position_changed) {
+        self.events.put(.{ .pointer_motion = .{
+            .x = self.pointer_position_x,
+            .y = self.pointer_position_y,
         } }) catch {
             std.log.warn("event queue full, a pointer moved event missed", .{});
         };
-        impl.pointer_position_changed = false;
+        self.pointer_position_changed = false;
     }
-    if (impl.pointer_axis_changed) {
-        impl.events.put(.{ .pointer_wheel = .{
-            .x = impl.pointer_axis_x / 120,
-            .y = impl.pointer_axis_y / 120,
+    if (self.pointer_axis_changed) {
+        self.events.put(.{ .pointer_wheel = .{
+            .x = self.pointer_axis_x / 120,
+            .y = self.pointer_axis_y / 120,
         } }) catch {
             std.log.warn("event queue full, a pointer wheel event missed", .{});
         };
-        impl.pointer_axis_x = 0;
-        impl.pointer_axis_y = 0;
-        impl.pointer_axis_changed = false;
+        self.pointer_axis_x = 0;
+        self.pointer_axis_y = 0;
+        self.pointer_axis_changed = false;
     }
 }
 
@@ -1087,13 +1280,13 @@ fn wlPointerAxisValue120(
     value120: i32,
 ) callconv(.c) void {
     _ = wl_pointer;
-    const impl: *Impl = @ptrCast(@alignCast(data));
-    impl.pointer_axis_changed = true;
+    const self: *Self = @ptrCast(@alignCast(data));
+    self.pointer_axis_changed = true;
     if (axis == c.WL_POINTER_AXIS_VERTICAL_SCROLL) {
-        impl.pointer_axis_y += @floatFromInt(value120);
+        self.pointer_axis_y += @floatFromInt(value120);
         return;
     }
-    impl.pointer_axis_x += @floatFromInt(value120);
+    self.pointer_axis_x += @floatFromInt(value120);
 }
 
 fn wlPointerAxisRelativeDirection(
