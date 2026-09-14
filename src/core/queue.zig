@@ -55,7 +55,7 @@ pub fn Queue(comptime T: type, comptime capacity: usize) type {
         }
 
         pub const Iterator = struct {
-            queue: *Self,
+            queue: *const Self,
             i: usize,
             count: usize,
 
@@ -68,7 +68,7 @@ pub fn Queue(comptime T: type, comptime capacity: usize) type {
             }
         };
 
-        pub fn iterator(self: *Self) Iterator {
+        pub fn iterator(self: *const Self) Iterator {
             return Iterator{ .queue = self, .i = self.head, .count = self.len };
         }
     };
@@ -162,7 +162,7 @@ pub fn AllocQueue(comptime T: type) type {
         }
 
         pub const Iterator = struct {
-            queue: *Self,
+            queue: *const Self,
             i: usize,
             count: usize,
 
@@ -175,7 +175,7 @@ pub fn AllocQueue(comptime T: type) type {
             }
         };
 
-        pub fn iterator(self: *Self) Iterator {
+        pub fn iterator(self: *const Self) Iterator {
             return Iterator{ .queue = self, .i = self.head, .count = self.len };
         }
     };

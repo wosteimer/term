@@ -2,6 +2,8 @@ const std = @import("std");
 const Platform = @import("platform/root.zig").Platform;
 const c = @import("c");
 const unicode = @import("unicode.zig");
+const Pool = @import("core/pool.zig").Pool;
+const Handler = @import("core/pool.zig").Handler;
 
 const Self = @This();
 const Render = @This();
@@ -150,7 +152,6 @@ pub const Shaped = struct {
 
 const Shaper = struct {
     font: *Font,
-    render: *Render,
     fixed_advance: ?i32 = null,
     hb_buffer: ?*c.hb_buffer_t,
     infos: []c.hb_glyph_info_t,
@@ -160,7 +161,6 @@ const Shaper = struct {
     pub fn init(
         font: *Font,
         features: []const []const u8,
-        render: *Render,
         text: []const u8,
         start: usize,
         end: usize,
@@ -192,7 +192,6 @@ const Shaper = struct {
 
         return .{
             .font = font,
-            .render = render,
             .fixed_advance = fixed_advance,
             .hb_buffer = hb_buffer,
             .infos = infos,
@@ -248,118 +247,737 @@ const Shaper = struct {
     }
 };
 
-const atlas_width = 4096;
-const atlas_height = 4096;
+pub const Image = Handler;
 
-arena: *std.heap.ArenaAllocator,
-ft: c.FT_Library,
-key_to_path: std.HashMap(FontKey, []const u8, FontContext, 70),
-fonts: std.StringHashMap(*Font),
+const InternalImage = struct {
+    allocator: ?std.mem.Allocator = null,
+    buf: []u32,
+    pixman_image: ?*c.pixman_image_t,
 
-cache_atlas_buf: []u32,
-cache_atlas: ?*c.pixman_image_t = null,
-cache_ctx: ?*c.stbrp_context = null,
-cache_nodes: []c.stbrp_node,
-cache_map: std.HashMap(GlyphKey, Glyph, GlyphContext, 70),
+    pub fn init(allocator: std.mem.Allocator, width: usize, height: usize) !InternalImage {
+        const buf = try allocator.alloc(u32, width * height);
+        var self = bufInit(buf, width, height);
+        self.allocator = allocator;
+        return self;
+    }
 
-platform: *Platform,
-dst: ?*c.pixman_image_t = null,
-
-pub fn init(allocator: std.mem.Allocator, platform: *Platform) !Self {
-    const arena = try allocator.create(std.heap.ArenaAllocator);
-    arena.* = .init(allocator);
-    const arena_allocator = arena.allocator();
-    var ft: c.FT_Library = undefined;
-    _ = c.FT_Init_FreeType(&ft);
-    _ = c.FcInit();
-    var self = Self{
-        .arena = arena,
-        .ft = ft,
-        .cache_ctx = try arena_allocator.create(c.stbrp_context),
-        .key_to_path = .init(arena_allocator),
-        .fonts = .init(arena_allocator),
-        .cache_atlas_buf = try arena_allocator.alloc(u32, atlas_width * atlas_height),
-        .cache_nodes = try arena_allocator.alloc(c.stbrp_node, atlas_width),
-        .cache_map = .init(arena_allocator),
-        .platform = platform,
-    };
-    self.cache_atlas = c.pixman_image_create_bits_no_clear(
-        c.PIXMAN_a8r8g8b8,
-        @intCast(atlas_width),
-        @intCast(atlas_height),
-        self.cache_atlas_buf.ptr,
-        calcStride(atlas_width, 32),
-    );
-    c.stbrp_init_target(
-        self.cache_ctx,
-        @intCast(atlas_width),
-        @intCast(atlas_height),
-        self.cache_nodes.ptr,
-        @intCast(self.cache_nodes.len),
-    );
-    return self;
-}
-
-pub fn deinit(self: *Self) void {
-    var fonts = self.fonts.valueIterator();
-    while (fonts.next()) |font| font.*.deinit();
-    _ = c.pixman_image_unref(self.cache_atlas);
-
-    self.arena.deinit();
-    const allocator = self.arena.child_allocator;
-    allocator.destroy(self.arena);
-
-    _ = c.FT_Done_FreeType(self.ft);
-    c.FcFini();
-}
-
-pub fn startDraw(self: *Self) bool {
-    if (self.dst != null) return false;
-    if (self.platform.getBuffer()) |buf| {
-        const size = self.platform.getSize();
-        self.dst = c.pixman_image_create_bits_no_clear(
+    pub fn bufInit(buf: []u32, width: usize, height: usize) InternalImage {
+        std.debug.assert(width * height <= buf.len);
+        const stride = calcStride(@intCast(width), @bitSizeOf(u32));
+        const pixman_image = c.pixman_image_create_bits(
             c.PIXMAN_a8r8g8b8,
-            @intCast(size.width),
-            @intCast(size.height),
-            @ptrCast(buf),
-            calcStride(@intCast(size.width), 32),
+            @intCast(width),
+            @intCast(height),
+            buf.ptr,
+            stride,
         );
-        return true;
+        std.debug.assert(pixman_image != null);
+        return .{
+            .buf = buf,
+            .pixman_image = pixman_image,
+        };
     }
-    return false;
-}
 
-pub fn endDraw(self: *Self) !void {
-    if (self.dst) |dst| {
-        _ = c.pixman_image_unref(dst);
-        self.dst = null;
-        self.platform.present();
-        return;
+    pub fn deinit(self: *const InternalImage) void {
+        if (self.allocator) |allocator| {
+            allocator.free(self.buf);
+        }
+        _ = c.pixman_image_unref(self.pixman_image);
     }
-    return error.NotStarted;
-}
 
-pub fn fill(self: *Self, color: ARGB) !void {
-    if (self.dst) |dst| {
-        const size = self.platform.getSize();
+    pub fn fill(self: *const InternalImage, color: ARGB) void {
         _ = c.pixman_image_fill_rectangles(
             c.PIXMAN_OP_SRC,
-            dst,
+            self.pixman_image,
             &argbToColor(color),
             1,
             &c.pixman_rectangle16{
                 .x = 0,
                 .y = 0,
-                .width = @intCast(size.width),
-                .height = @intCast(size.height),
+                .width = @intCast(c.pixman_image_get_width(self.pixman_image)),
+                .height = @intCast(c.pixman_image_get_height(self.pixman_image)),
             },
         );
-        return;
     }
-    return error.NotStarted;
+
+    pub fn drawRect(self: *const InternalImage, rect: Rect, color: ARGB) void {
+        const width: i32 = @intCast(c.pixman_image_get_width(self.pixman_image));
+        const height: i32 = @intCast(c.pixman_image_get_height(self.pixman_image));
+        const x1 = std.math.clamp(rect.x, 0, width);
+        const x2 = std.math.clamp(rect.x + @as(i32, @intCast(rect.width)), 0, width);
+        const y1 = std.math.clamp(rect.y, 0, height);
+        const y2 = std.math.clamp(rect.y + @as(i32, @intCast(rect.height)), 0, height);
+        _ = c.pixman_image_fill_boxes(
+            c.PIXMAN_OP_SRC,
+            self.pixman_image,
+            &argbToColor(color),
+            1,
+            &c.pixman_box32{
+                .x1 = x1,
+                .y1 = y1,
+                .x2 = x2,
+                .y2 = y2,
+            },
+        );
+    }
+
+    pub fn drawText(self: *const InternalImage, info: DrawTextInfo, cache: *FontCache) !void {
+        var cursor = info.start;
+        const main_font_key = FontKey{
+            .name = info.font.name,
+            .size = info.font.size,
+            .italic = info.font.italic,
+            .weight = info.font.weight,
+        };
+        const main_font = try cache.getFont(main_font_key);
+        const ascender: i32 = @intCast(applyFontScaleFactor(
+            main_font,
+            main_font.*.ft_face.*.size.*.metrics.ascender >> 6,
+        ));
+
+        const emoji_font_key = FontKey{
+            .name = "emoji",
+            .size = info.font.size,
+            .italic = info.font.italic,
+            .weight = info.font.weight,
+        };
+
+        var fixed_advance: ?i32 = null;
+        if (info.font.monospace) {
+            const max_advance: i32 = @intCast(main_font.ft_face.*.size.*.metrics.max_advance >> 6);
+            fixed_advance = applyFontScaleFactor(main_font, max_advance);
+        }
+
+        var font = main_font;
+        var next_font_key = font;
+
+        var iter: unicode.GraphemeIter = undefined;
+        iter.init(info.text);
+        var finish_run: bool = false;
+        var fallback: bool = false;
+        var start: usize = 0;
+        var end: usize = 0;
+
+        while (try iter.next()) |current| {
+            const bytes, const codepoints = .{ current.bytes, current.codepoints };
+            if (unicode.isEmoji(codepoints)) {
+                fallback = true;
+                finish_run = true;
+                const emoji_font = try cache.getFont(emoji_font_key);
+                next_font_key = emoji_font;
+            } else if (fallback and c.FT_Get_Char_Index(main_font.ft_face, codepoints[0]) != 0) {
+                fallback = false;
+                finish_run = true;
+                next_font_key = main_font;
+            } else if (c.FT_Get_Char_Index(font.ft_face, codepoints[0]) == 0) {
+                fallback = true;
+                finish_run = true;
+                var next_key = main_font_key;
+                next_key.codepoint = codepoints[0];
+                next_font_key = try cache.getFont(next_key);
+            }
+
+            if (finish_run and start != end) {
+                var shaper = try Shaper.init(font, info.font.features, info.text, start, end, fixed_advance);
+                defer shaper.deinit();
+                try self.drawShaper(.{
+                    .shaper = &shaper,
+                    .ascender = ascender,
+                    .cursor = &cursor,
+                    .color = info.color,
+                    .cache = cache,
+                });
+                start = end;
+            }
+
+            finish_run = false;
+            end += bytes.len;
+            font = next_font_key;
+        }
+
+        if (start != end) {
+            var shaper = try Shaper.init(font, info.font.features, info.text, start, end, fixed_advance);
+            defer shaper.deinit();
+            try self.drawShaper(.{
+                .shaper = &shaper,
+                .ascender = ascender,
+                .cursor = &cursor,
+                .color = info.color,
+                .cache = cache,
+            });
+        }
+    }
+
+    pub const DrawShaperInfo = struct {
+        shaper: *Shaper,
+        cursor: *Point,
+        ascender: i32,
+        color: ARGB = @bitCast(@as(u32, 0xFFFFFFFF)),
+        cache: *FontCache,
+    };
+
+    fn drawShaper(self: *const InternalImage, info: DrawShaperInfo) !void {
+        const dst = self.pixman_image;
+        const ascender = info.ascender;
+
+        while (try info.shaper.next()) |shaped_glyph| {
+            const font = info.cache.fonts.get(shaped_glyph.font_path).?;
+            const glyph = try info.cache.getGlyph(font, shaped_glyph.codepoint);
+            switch (glyph.render_mode) {
+                .none => {},
+                .color => {
+                    c.pixman_image_composite32(
+                        c.PIXMAN_OP_OVER,
+                        info.cache.atlas,
+                        null,
+                        dst,
+                        glyph.rect.x,
+                        glyph.rect.y,
+                        0,
+                        0,
+                        info.cursor.x + shaped_glyph.offset.x + glyph.left,
+                        info.cursor.y + shaped_glyph.offset.y + (ascender - glyph.top),
+                        @intCast(glyph.rect.width),
+                        @intCast(glyph.rect.height),
+                    );
+                },
+                .gray, .mono => {
+                    const src = c.pixman_image_create_solid_fill(&argbToColor(info.color));
+                    defer _ = c.pixman_image_unref(src);
+                    c.pixman_image_composite32(
+                        c.PIXMAN_OP_OVER,
+                        src,
+                        info.cache.atlas,
+                        dst,
+                        0,
+                        0,
+                        glyph.rect.x,
+                        glyph.rect.y,
+                        info.cursor.x + shaped_glyph.offset.x + glyph.left,
+                        info.cursor.y + shaped_glyph.offset.y + (ascender - glyph.top),
+                        @intCast(glyph.rect.width),
+                        @intCast(glyph.rect.height),
+                    );
+                },
+            }
+
+            info.cursor.x += shaped_glyph.advance.x;
+            info.cursor.y += shaped_glyph.advance.y;
+        }
+    }
+
+    pub fn drawImage(self: *const InternalImage, src_image: *const InternalImage, src_offset: Point, dst_rect: Rect) void {
+        const dst = self.pixman_image;
+        const src = src_image.pixman_image;
+
+        c.pixman_image_composite32(
+            c.PIXMAN_OP_OVER,
+            src,
+            null,
+            dst,
+            @intCast(src_offset.x),
+            @intCast(src_offset.y),
+            0,
+            0,
+            @intCast(dst_rect.x),
+            @intCast(dst_rect.y),
+            @intCast(dst_rect.width),
+            @intCast(dst_rect.height),
+        );
+    }
+};
+
+const FontCache = struct {
+    const atlas_width = 4096;
+    const atlas_height = 4096;
+
+    arena: *std.heap.ArenaAllocator,
+    ft: c.FT_Library,
+    key_to_path: std.HashMap(FontKey, []const u8, FontContext, 70),
+    fonts: std.StringHashMap(*Font),
+
+    atlas_buf: []u32,
+    atlas: ?*c.pixman_image_t = null,
+    ctx: ?*c.stbrp_context = null,
+    nodes: []c.stbrp_node,
+    map: std.HashMap(GlyphKey, Glyph, GlyphContext, 70),
+
+    pub fn init(allocator: std.mem.Allocator) !FontCache {
+        const arena = try allocator.create(std.heap.ArenaAllocator);
+        arena.* = .init(allocator);
+        const arena_allocator = arena.allocator();
+        var ft: c.FT_Library = undefined;
+        _ = c.FT_Init_FreeType(&ft);
+        _ = c.FcInit();
+        var self = FontCache{
+            .arena = arena,
+            .ft = ft,
+            .ctx = try arena_allocator.create(c.stbrp_context),
+            .key_to_path = .init(arena_allocator),
+            .fonts = .init(arena_allocator),
+            .atlas_buf = try arena_allocator.alloc(u32, atlas_width * atlas_height),
+            .nodes = try arena_allocator.alloc(c.stbrp_node, atlas_width),
+            .map = .init(arena_allocator),
+        };
+        self.atlas = c.pixman_image_create_bits_no_clear(
+            c.PIXMAN_a8r8g8b8,
+            @intCast(atlas_width),
+            @intCast(atlas_height),
+            self.atlas_buf.ptr,
+            calcStride(atlas_width, 32),
+        );
+        c.stbrp_init_target(
+            self.ctx,
+            @intCast(atlas_width),
+            @intCast(atlas_height),
+            self.nodes.ptr,
+            @intCast(self.nodes.len),
+        );
+        return self;
+    }
+
+    pub fn deinit(self: *FontCache) void {
+        var fonts = self.fonts.valueIterator();
+        while (fonts.next()) |font| font.*.deinit();
+        _ = c.pixman_image_unref(self.atlas);
+
+        self.arena.deinit();
+        const allocator = self.arena.child_allocator;
+        allocator.destroy(self.arena);
+
+        _ = c.FT_Done_FreeType(self.ft);
+        c.FcFini();
+    }
+
+    const GetFontError = error{ OutOfMemory, InvalidFont };
+
+    pub fn getFont(self: *FontCache, key: FontKey) GetFontError!*Font {
+        if (self.key_to_path.get(key)) |path| {
+            const font = self.fonts.get(path).?;
+            return font;
+        }
+
+        const fc_pattern = createFcPattern(key);
+        defer {
+            var charset: ?*c.FcCharSet = undefined;
+            if (c.FcPatternGetCharSet(fc_pattern, c.FC_CHARSET, 0, &charset) == c.FcResultMatch) {
+                c.FcCharSetDestroy(charset);
+            }
+            c.FcPatternDestroy(fc_pattern);
+        }
+        var result: c.FcResult = undefined;
+        const fc_font = c.FcFontMatch(null, fc_pattern, &result);
+        if (result != c.FcResultMatch) {
+            return error.InvalidFont;
+        }
+        defer c.FcPatternDestroy(fc_font);
+
+        var fc_path: [*c]u8 = undefined;
+        if (c.FcPatternGetString(fc_font, c.FC_FILE, 0, &fc_path) != c.FcResultMatch) {
+            return error.InvalidFont;
+        }
+
+        const allocator = self.arena.allocator();
+        const path = try allocator.dupe(u8, std.mem.span(fc_path));
+
+        try self.key_to_path.put(try key.dupe(allocator), path);
+        if (self.fonts.get(path)) |font| {
+            return font;
+        }
+
+        const ft_face = try self.createFtFace(fc_font, key);
+
+        log.debug("font \"{s} {d}\" loaded", .{ ft_face.*.family_name, key.size });
+
+        const hb_font = c.hb_ft_font_create_referenced(ft_face);
+
+        var scale_factor: f64 = undefined;
+        if (c.FcPatternGetDouble(fc_font, "pixelsizefixupfactor", 0, &scale_factor) != c.FcResultMatch) {
+            const font_size: f32 = @floatFromInt(key.size);
+            const y_ppem: f32 = @floatFromInt(ft_face.*.size.*.metrics.y_ppem);
+            scale_factor = font_size / y_ppem;
+        }
+
+        const font = try allocator.create(Font);
+        font.* = .{
+            .ft_face = ft_face,
+            .hb_font = hb_font,
+            .scale_factor = scale_factor,
+            .path = path,
+        };
+        try self.fonts.put(path, font);
+
+        return font;
+    }
+
+    fn createFcPattern(key: FontKey) ?*c.FcPattern {
+        const fc_pattern = c.FcPatternCreate();
+
+        const name_max_len = 256;
+        var name_buf: [name_max_len]u8 = undefined;
+        const name_len: usize = @min(name_max_len, key.name.len);
+        const name = std.fmt.bufPrintSentinel(&name_buf, "{s}", .{key.name[0..name_len]}, 0) catch unreachable;
+        _ = c.FcPatternAddString(fc_pattern, c.FC_FAMILY, name);
+
+        _ = c.FcPatternAddDouble(fc_pattern, c.FC_PIXEL_SIZE, @floatFromInt(key.size));
+
+        _ = c.FcPatternAddInteger(fc_pattern, c.FC_WEIGHT, switch (key.weight) {
+            .thin => c.FC_WEIGHT_THIN,
+            .extralight => c.FC_WEIGHT_EXTRALIGHT,
+            .ultralight => c.FC_WEIGHT_ULTRALIGHT,
+            .light => c.FC_WEIGHT_LIGHT,
+            .demilight => c.FC_WEIGHT_DEMILIGHT,
+            .semilight => c.FC_WEIGHT_SEMILIGHT,
+            .book => c.FC_WEIGHT_BOOK,
+            .regular => c.FC_WEIGHT_REGULAR,
+            .normal => c.FC_WEIGHT_NORMAL,
+            .medium => c.FC_WEIGHT_MEDIUM,
+            .demibold => c.FC_WEIGHT_DEMIBOLD,
+            .semibold => c.FC_WEIGHT_SEMIBOLD,
+            .bold => c.FC_WEIGHT_BOLD,
+            .extrabold => c.FC_WEIGHT_EXTRABOLD,
+            .ultrabold => c.FC_WEIGHT_ULTRABOLD,
+            .black => c.FC_WEIGHT_BLACK,
+            .heavy => c.FC_WEIGHT_HEAVY,
+            .extrablack => c.FC_WEIGHT_EXTRABLACK,
+            .ultrablack => c.FC_WEIGHT_ULTRABLACK,
+        });
+
+        if (key.italic) {
+            _ = c.FcPatternAddInteger(fc_pattern, c.FC_SLANT, c.FC_SLANT_ITALIC);
+        }
+
+        if (key.codepoint != 0) {
+            const charset = c.FcCharSetCreate();
+            if (key.codepoint) |codepoint| {
+                _ = c.FcCharSetAddChar(charset, codepoint);
+            }
+            _ = c.FcPatternAddCharSet(fc_pattern, c.FC_CHARSET, charset);
+        }
+
+        _ = c.FcConfigSubstitute(null, fc_pattern, c.FcMatchPattern);
+        c.FcDefaultSubstitute(fc_pattern);
+
+        return fc_pattern;
+    }
+
+    fn createFtFace(self: *FontCache, fc_font: ?*c.FcPattern, key: FontKey) error{InvalidFont}!c.FT_Face {
+        var fc_path: [*c]u8 = undefined;
+        if (c.FcPatternGetString(fc_font, c.FC_FILE, 0, &fc_path) != c.FcResultMatch) {
+            return error.InvalidFont;
+        }
+
+        var index: i32 = undefined;
+        if (c.FcPatternGetInteger(fc_font, c.FC_INDEX, 0, &index) != c.FcResultMatch) {
+            return error.InvalidFont;
+        }
+
+        var ft_face: c.FT_Face = undefined;
+        if (c.FT_New_Face(self.ft, fc_path, index, &ft_face) != 0) {
+            return error.InvalidFont;
+        }
+        if (ft_face.*.num_fixed_sizes > 0 and !c.FT_IS_SCALABLE(ft_face)) {
+            var best: c_int = 0;
+            var best_diff = @abs(ft_face.*.available_sizes[0].height - key.size);
+            for (1..@intCast(ft_face.*.num_fixed_sizes)) |i| {
+                const h = ft_face.*.available_sizes[i].height;
+                const diff = @abs(h - key.size);
+                if (diff < best_diff) {
+                    best = @intCast(i);
+                    best_diff = diff;
+                }
+            }
+            _ = c.FT_Select_Size(ft_face, best);
+        } else {
+            _ = c.FT_Set_Pixel_Sizes(ft_face, 0, key.size);
+        }
+
+        return ft_face;
+    }
+
+    const GetGlyphError = error{ GlyphNotFound, GlyphNotRendered, GlyphTooLarge, UnsupportedPixelMode } ||
+        GetFontError;
+
+    pub fn getGlyph(self: *FontCache, font: *Font, codepoint: u32) GetGlyphError!Glyph {
+        const key = GlyphKey{ .path = font.path, .codepoint = codepoint };
+        if (self.map.get(key)) |glyph| return glyph;
+
+        if (c.FT_Load_Glyph(font.ft_face, codepoint, c.FT_LOAD_DEFAULT | c.FT_LOAD_COLOR) != 0) {
+            return error.GlyphNotFound;
+        }
+        const slot = font.ft_face.*.glyph;
+        if (c.FT_Render_Glyph(slot, c.FT_RENDER_MODE_NORMAL) != 0) {
+            return error.GlyphNotRendered;
+        }
+
+        const bitmap = slot.*.bitmap;
+        const width: u32 = @intCast(bitmap.width);
+        const height: u32 = @intCast(bitmap.rows);
+        const pitch: usize = @intCast(bitmap.pitch);
+        const top: i32 = applyFontScaleFactor(font, slot.*.bitmap_top);
+        const left: i32 = applyFontScaleFactor(font, slot.*.bitmap_left);
+
+        if (width == 0 or height == 0) {
+            const glyph = Glyph{ .render_mode = .none, .rect = .{}, .top = 0, .left = 0 };
+            try self.map.put(key, glyph);
+            return glyph;
+        }
+
+        const rect = try self.packRect(applyFontScaleFactor(font, width), applyFontScaleFactor(font, height));
+        var glyph = Glyph{
+            .render_mode = .none,
+            .rect = rect,
+            .top = @intCast(top),
+            .left = @intCast(left),
+        };
+
+        switch (bitmap.pixel_mode) {
+            c.FT_PIXEL_MODE_BGRA => self.copyColorGlyphToAtlas(
+                @ptrCast(@alignCast(bitmap.buffer)),
+                width,
+                height,
+                font.scale_factor,
+                &glyph,
+            ),
+            c.FT_PIXEL_MODE_GRAY => self.copyGrayGlyphToAtlas(bitmap.buffer, width, height, &glyph),
+            c.FT_PIXEL_MODE_MONO => self.copyMonoGlyphToAtlas(bitmap.buffer, width, height, pitch, &glyph),
+            else => return error.UnsupportedPixelMode,
+        }
+
+        try self.map.put(key, glyph);
+        return glyph;
+    }
+
+    fn packRect(self: *FontCache, width: u32, height: u32) error{GlyphTooLarge}!Rect {
+        var rect: c.stbrp_rect = .{
+            .w = @intCast(width),
+            .h = @intCast(height),
+        };
+        _ = c.stbrp_pack_rects(self.ctx, &rect, 1);
+        if (rect.was_packed == 0) {
+            c.stbrp_init_target(
+                self.ctx,
+                @intCast(atlas_width),
+                @intCast(atlas_height),
+                self.nodes.ptr,
+                @intCast(self.nodes.len),
+            );
+            self.map.clearRetainingCapacity();
+            _ = c.stbrp_pack_rects(self.ctx, &rect, 1);
+            log.warn("Glyph cache is full, cleared", .{});
+            if (rect.was_packed == 0) return error.GlyphTooLarge;
+        }
+        return .{
+            .x = @intCast(rect.x),
+            .y = @intCast(rect.y),
+            .width = @intCast(rect.w),
+            .height = @intCast(rect.h),
+        };
+    }
+
+    fn copyColorGlyphToAtlas(
+        self: *FontCache,
+        buf: [*]u32,
+        width: u32,
+        height: u32,
+        scale_factor: f64,
+        glyph: *Glyph,
+    ) void {
+        glyph.render_mode = .color;
+
+        const src = c.pixman_image_create_bits_no_clear(
+            c.PIXMAN_a8r8g8b8,
+            @intCast(width),
+            @intCast(height),
+            buf,
+            calcStride(@intCast(width), 32),
+        );
+        defer _ = c.pixman_image_unref(src);
+
+        setScale(src, scale_factor);
+
+        c.pixman_image_composite32(
+            c.PIXMAN_OP_SRC,
+            src,
+            null,
+            self.atlas,
+            0,
+            0,
+            0,
+            0,
+            glyph.rect.x,
+            glyph.rect.y,
+            @intCast(glyph.rect.width),
+            @intCast(glyph.rect.height),
+        );
+    }
+
+    fn setScale(src: ?*c.pixman_image, scale_factor: f64) void {
+        var scale: c.pixman_transform = undefined;
+        const inv_scale_factor = doubleToFixed(1 / scale_factor);
+        c.pixman_transform_init_scale(&scale, inv_scale_factor, inv_scale_factor);
+        _ = c.pixman_image_set_transform(src, &scale);
+        const kernel = c.PIXMAN_KERNEL_BOX;
+        var n_values: i32 = undefined;
+        const values = c.pixman_filter_create_separable_convolution(
+            &n_values,
+            inv_scale_factor,
+            inv_scale_factor,
+            kernel,
+            kernel,
+            kernel,
+            kernel,
+            1,
+            1,
+        );
+        defer c.free(values);
+        _ = c.pixman_image_set_filter(
+            src,
+            c.PIXMAN_FILTER_SEPARABLE_CONVOLUTION,
+            values,
+            n_values,
+        );
+    }
+
+    fn copyGrayGlyphToAtlas(self: *FontCache, buf: [*]u8, width: u32, height: u32, glyph: *Glyph) void {
+        glyph.render_mode = .gray;
+        const stride: usize = @intCast(calcStride(@intCast(width), 8));
+        var tmp_buf: [256 * 256]u8 = undefined;
+        for (0..@intCast(height)) |y| {
+            for (0..@intCast(width)) |x| {
+                tmp_buf[y * stride + x] = buf[y * @as(usize, @intCast(width)) + x];
+            }
+        }
+        const src = c.pixman_image_create_bits_no_clear(
+            c.PIXMAN_a8,
+            @intCast(width),
+            @intCast(height),
+            @ptrCast(@alignCast(&tmp_buf)),
+            @intCast(stride),
+        );
+        defer _ = c.pixman_image_unref(src);
+
+        c.pixman_image_composite32(
+            c.PIXMAN_OP_SRC,
+            src,
+            null,
+            self.atlas,
+            0,
+            0,
+            0,
+            0,
+            glyph.rect.x,
+            glyph.rect.y,
+            @intCast(glyph.rect.width),
+            @intCast(glyph.rect.height),
+        );
+    }
+
+    fn copyMonoGlyphToAtlas(self: *FontCache, buf: [*]u8, width: u32, height: u32, pitch: usize, glyph: *Glyph) void {
+        glyph.render_mode = .mono;
+
+        const stride: usize = @intCast(calcStride(@intCast(width), 8));
+        var tmp_buf: [256 * 256]u8 = undefined;
+        for (0..@intCast(height)) |y| {
+            for (0..@intCast(width)) |x| {
+                const value = buf[y * pitch + x];
+                tmp_buf[y * stride + x] = @bitReverse(value);
+            }
+        }
+        const src = c.pixman_image_create_bits_no_clear(
+            c.PIXMAN_a1,
+            @intCast(width),
+            @intCast(height),
+            @ptrCast(@alignCast(&tmp_buf)),
+            @intCast(stride),
+        );
+        defer _ = c.pixman_image_unref(src);
+
+        c.pixman_image_composite32(
+            c.PIXMAN_OP_SRC,
+            src,
+            null,
+            self.atlas,
+            0,
+            0,
+            0,
+            0,
+            glyph.rect.x,
+            glyph.rect.y,
+            @intCast(glyph.rect.width),
+            @intCast(glyph.rect.height),
+        );
+    }
+};
+
+const image_pool_capacity = 64;
+
+allocator: std.mem.Allocator,
+
+platform: *Platform,
+font_cache: FontCache,
+image_pool: Pool(InternalImage),
+
+pub fn init(allocator: std.mem.Allocator, platform: *Platform) !Self {
+    return .{
+        .allocator = allocator,
+        .font_cache = try .init(allocator),
+        .image_pool = try .init(allocator, image_pool_capacity),
+        .platform = platform,
+    };
 }
 
-pub const ShapeTextInfo = struct {
+pub fn deinit(self: *Self) void {
+    self.image_pool.deinit(self.allocator);
+    self.font_cache.deinit();
+}
+
+pub fn createImage(self: *Self, width: usize, height: usize) !Image {
+    const handler = try self.image_pool.create();
+    const entry = self.image_pool.getEntry(handler) catch unreachable;
+    entry.value = try InternalImage.init(self.allocator, width, height);
+    return handler;
+}
+
+pub fn createBufImage(self: *Self, buf: []u32, width: u32, height: u32) !Image {
+    const handler = try self.image_pool.create();
+    const entry = self.image_pool.getEntry(handler) catch unreachable;
+    entry.value = InternalImage.bufInit(buf, width, height);
+    return handler;
+}
+
+pub fn destroyImage(self: *Self, image: Image) !void {
+    const entry = try self.image_pool.getEntry(image);
+    entry.value.?.deinit();
+    self.image_pool.destroy(image) catch unreachable;
+}
+
+pub fn startDraw(self: *Self) !?Image {
+    if (self.platform.getBuffer()) |buf| {
+        const size = self.platform.getSize();
+        return try self.createBufImage(buf, size.width, size.height);
+    }
+    return null;
+}
+
+pub fn endDraw(self: *Self, image: Image) !void {
+    try self.destroyImage(image);
+    self.platform.present();
+}
+
+pub fn fill(self: *Self, image: Image, color: ARGB) !void {
+    const entry = try self.image_pool.getEntry(image);
+    const internal = entry.value.?;
+    internal.fill(color);
+}
+
+pub fn drawRect(self: *Render, image: Image, rect: Rect, color: ARGB) !void {
+    const entry = try self.image_pool.getEntry(image);
+    const internal = entry.value.?;
+    internal.drawRect(rect, color);
+}
+
+pub const DrawTextInfo = struct {
     pub const Font = struct {
         name: []const u8,
         size: u8,
@@ -368,166 +986,26 @@ pub const ShapeTextInfo = struct {
         features: []const []const u8 = &.{},
         monospace: bool = false,
     };
-    font: ShapeTextInfo.Font,
+    font: DrawTextInfo.Font,
+    start: Point = .{},
+    color: ARGB = @bitCast(@as(u32, 0xFFFFFFFF)),
     text: []const u8,
 };
 
-fn shapeText(self: *Self, allocator: ?std.mem.Allocator, info: ShapeTextInfo, out: *std.ArrayList(Shaped.Glyph)) !i32 {
-    const main_font_key = FontKey{
-        .name = info.font.name,
-        .size = info.font.size,
-        .italic = info.font.italic,
-        .weight = info.font.weight,
-    };
-    const main_font = try self.getFont(main_font_key);
-
-    const emoji_font_key = FontKey{
-        .name = "emoji",
-        .size = info.font.size,
-        .italic = info.font.italic,
-        .weight = info.font.weight,
-    };
-
-    var fixed_advance: ?i32 = null;
-    if (info.font.monospace) {
-        const max_advance: i32 = @intCast(main_font.ft_face.*.size.*.metrics.max_advance >> 6);
-        fixed_advance = applyFontScaleFactor(main_font, max_advance);
-    }
-
-    var font = main_font;
-    var next_font_key = font;
-
-    var iter: unicode.GraphemeIter = undefined;
-    iter.init(info.text);
-    var finish_run: bool = false;
-    var fallback: bool = false;
-    var start: usize = 0;
-    var end: usize = 0;
-
-    while (try iter.next()) |current| {
-        const bytes, const codepoints = .{ current.bytes, current.codepoints };
-        if (unicode.isEmoji(codepoints)) {
-            fallback = true;
-            finish_run = true;
-            const emoji_font = try self.getFont(emoji_font_key);
-            next_font_key = emoji_font;
-        } else if (fallback and c.FT_Get_Char_Index(main_font.ft_face, codepoints[0]) != 0) {
-            fallback = false;
-            finish_run = true;
-            next_font_key = main_font;
-        } else if (c.FT_Get_Char_Index(font.ft_face, codepoints[0]) == 0) {
-            fallback = true;
-            finish_run = true;
-            var next_key = main_font_key;
-            next_key.codepoint = codepoints[0];
-            next_font_key = try self.getFont(next_key);
-        }
-
-        if (finish_run and start != end) {
-            var shaper = try Shaper.init(font, info.font.features, self, info.text, start, end, fixed_advance);
-            defer shaper.deinit();
-            while (try shaper.next()) |shaped_glyph| {
-                if (allocator) |alloc| {
-                    try out.append(alloc, shaped_glyph);
-                } else {
-                    try out.appendBounded(shaped_glyph);
-                }
-            }
-            start = end;
-        }
-
-        finish_run = false;
-        end += bytes.len;
-        font = next_font_key;
-    }
-
-    if (start != end) {
-        var shaper = try Shaper.init(font, info.font.features, self, info.text, start, end, fixed_advance);
-        defer shaper.deinit();
-        while (try shaper.next()) |shaped_glyph| {
-            if (allocator) |alloc| {
-                try out.append(alloc, shaped_glyph);
-            } else {
-                try out.appendBounded(shaped_glyph);
-            }
-        }
-    }
-    return @intCast(applyFontScaleFactor(main_font, main_font.*.ft_face.*.size.*.metrics.ascender >> 6));
+pub fn drawText(self: *Self, image: Image, info: DrawTextInfo) !void {
+    const entry = try self.image_pool.getEntry(image);
+    const internal = entry.value.?;
+    try internal.drawText(info, &self.font_cache);
 }
 
-pub fn bufShapeText(self: *Render, buf: []Shaped.Glyph, info: ShapeTextInfo) !Shaped {
-    var out = std.ArrayList(Shaped.Glyph).initBuffer(buf);
-    const ascender = try self.shapeText(null, info, &out);
-    return .{
-        .glyphs = out.items,
-        .ascender = ascender,
-    };
-}
+pub fn drawImage(self: *Render, dst: Image, src: Image, src_offset: Point, dst_rect: Rect) !void {
+    const dst_entry = try self.image_pool.getEntry(dst);
+    const src_entry = try self.image_pool.getEntry(src);
 
-pub fn allocShapeText(self: *Render, allocator: std.mem.Allocator, info: ShapeTextInfo) !Shaped {
-    var out = std.ArrayList(Shaped.Glyph).empty;
-    const ascender = try self.shapeText(allocator, info, &out);
-    return .{
-        .glyphs = try out.toOwnedSlice(allocator),
-        .ascender = ascender,
-    };
-}
+    const dst_internal = dst_entry.value.?;
+    const src_internal = src_entry.value.?;
 
-pub const DrawShapeTextInfo = struct {
-    shaped_text: Shaped,
-    start: Point = .{},
-    color: ARGB = @bitCast(@as(u32, 0xFFFFFFFF)),
-};
-
-pub fn drawShappedText(self: *Render, info: DrawShapeTextInfo) !void {
-    const dst = self.dst orelse return error.NotStarted;
-    const ascender = info.shaped_text.ascender;
-    var cursor: Point = info.start;
-
-    for (info.shaped_text.glyphs) |shaped_glyph| {
-        const font = self.fonts.get(shaped_glyph.font_path).?;
-        const glyph = try self.getGlyph(font, shaped_glyph.codepoint);
-        switch (glyph.render_mode) {
-            .none => {},
-            .color => {
-                c.pixman_image_composite32(
-                    c.PIXMAN_OP_OVER,
-                    self.cache_atlas,
-                    null,
-                    dst,
-                    glyph.rect.x,
-                    glyph.rect.y,
-                    0,
-                    0,
-                    cursor.x + shaped_glyph.offset.x + glyph.left,
-                    cursor.y + shaped_glyph.offset.y + (ascender - glyph.top),
-                    @intCast(glyph.rect.width),
-                    @intCast(glyph.rect.height),
-                );
-            },
-            .gray, .mono => {
-                const src = c.pixman_image_create_solid_fill(&argbToColor(info.color));
-                defer _ = c.pixman_image_unref(src);
-                c.pixman_image_composite32(
-                    c.PIXMAN_OP_OVER,
-                    src,
-                    self.cache_atlas,
-                    dst,
-                    0,
-                    0,
-                    glyph.rect.x,
-                    glyph.rect.y,
-                    cursor.x + shaped_glyph.offset.x + glyph.left,
-                    cursor.y + shaped_glyph.offset.y + (ascender - glyph.top),
-                    @intCast(glyph.rect.width),
-                    @intCast(glyph.rect.height),
-                );
-            },
-        }
-
-        cursor.x += shaped_glyph.advance.x;
-        cursor.y += shaped_glyph.advance.y;
-    }
+    dst_internal.drawImage(&src_internal, src_offset, dst_rect);
 }
 
 pub const Metrics = struct {
@@ -552,406 +1030,13 @@ pub fn getFontMetrics(self: *Render, info: GetFontMetricsInfo) !Metrics {
         .weight = info.weight,
         .italic = info.italic,
     };
-    const font = try self.getFont(key);
+    const font = try self.font_cache.getFont(key);
     return .{
         .height = @intCast(font.ft_face.*.size.*.metrics.height >> 6),
         .max_advance = @intCast(font.ft_face.*.size.*.metrics.max_advance >> 6),
         .ascender = @intCast(font.ft_face.*.size.*.metrics.ascender >> 6),
         .descender = @intCast(font.ft_face.*.size.*.metrics.descender >> 6),
     };
-}
-
-pub fn drawRect(self: *Render, rect: Rect, color: ARGB) !void {
-    if (self.dst) |dst| {
-        const size = self.platform.getSize();
-        const x1 = std.math.clamp(rect.x, 0, size.width);
-        const x2 = std.math.clamp(rect.x + @as(i32, @intCast(rect.width)), 0, size.width);
-        const y1 = std.math.clamp(rect.y, 0, size.height);
-        const y2 = std.math.clamp(rect.y + @as(i32, @intCast(rect.height)), 0, size.height);
-        _ = c.pixman_image_fill_boxes(
-            c.PIXMAN_OP_SRC,
-            dst,
-            &argbToColor(color),
-            1,
-            &c.pixman_box32{
-                .x1 = x1,
-                .y1 = y1,
-                .x2 = x2,
-                .y2 = y2,
-            },
-        );
-        return;
-    }
-    return error.NotStarted;
-}
-
-const GetFontError = error{ OutOfMemory, InvalidFont };
-
-fn getFont(self: *Self, key: FontKey) GetFontError!*Font {
-    if (self.key_to_path.get(key)) |path| {
-        const font = self.fonts.get(path).?;
-        return font;
-    }
-
-    const fc_pattern = createFcPattern(key);
-    defer {
-        var charset: ?*c.FcCharSet = undefined;
-        if (c.FcPatternGetCharSet(fc_pattern, c.FC_CHARSET, 0, &charset) == c.FcResultMatch) {
-            c.FcCharSetDestroy(charset);
-        }
-        c.FcPatternDestroy(fc_pattern);
-    }
-    var result: c.FcResult = undefined;
-    const fc_font = c.FcFontMatch(null, fc_pattern, &result);
-    if (result != c.FcResultMatch) {
-        return error.InvalidFont;
-    }
-    defer c.FcPatternDestroy(fc_font);
-
-    var fc_path: [*c]u8 = undefined;
-    if (c.FcPatternGetString(fc_font, c.FC_FILE, 0, &fc_path) != c.FcResultMatch) {
-        return error.InvalidFont;
-    }
-
-    const allocator = self.arena.allocator();
-    const path = try allocator.dupe(u8, std.mem.span(fc_path));
-
-    try self.key_to_path.put(try key.dupe(allocator), path);
-    if (self.fonts.get(path)) |font| {
-        return font;
-    }
-
-    const ft_face = try self.createFtFace(fc_font, key);
-
-    log.debug("font \"{s} {d}\" loaded", .{ ft_face.*.family_name, key.size });
-
-    const hb_font = c.hb_ft_font_create_referenced(ft_face);
-
-    var scale_factor: f64 = undefined;
-    if (c.FcPatternGetDouble(fc_font, "pixelsizefixupfactor", 0, &scale_factor) != c.FcResultMatch) {
-        const font_size: f32 = @floatFromInt(key.size);
-        const y_ppem: f32 = @floatFromInt(ft_face.*.size.*.metrics.y_ppem);
-        scale_factor = font_size / y_ppem;
-    }
-
-    const font = try allocator.create(Font);
-    font.* = .{
-        .ft_face = ft_face,
-        .hb_font = hb_font,
-        .scale_factor = scale_factor,
-        .path = path,
-    };
-    try self.fonts.put(path, font);
-
-    return font;
-}
-
-fn createFcPattern(key: FontKey) ?*c.FcPattern {
-    const fc_pattern = c.FcPatternCreate();
-
-    const name_max_len = 256;
-    var name_buf: [name_max_len]u8 = undefined;
-    const name_len: usize = @min(name_max_len, key.name.len);
-    const name = std.fmt.bufPrintSentinel(&name_buf, "{s}", .{key.name[0..name_len]}, 0) catch unreachable;
-    _ = c.FcPatternAddString(fc_pattern, c.FC_FAMILY, name);
-
-    _ = c.FcPatternAddDouble(fc_pattern, c.FC_PIXEL_SIZE, @floatFromInt(key.size));
-
-    _ = c.FcPatternAddInteger(fc_pattern, c.FC_WEIGHT, switch (key.weight) {
-        .thin => c.FC_WEIGHT_THIN,
-        .extralight => c.FC_WEIGHT_EXTRALIGHT,
-        .ultralight => c.FC_WEIGHT_ULTRALIGHT,
-        .light => c.FC_WEIGHT_LIGHT,
-        .demilight => c.FC_WEIGHT_DEMILIGHT,
-        .semilight => c.FC_WEIGHT_SEMILIGHT,
-        .book => c.FC_WEIGHT_BOOK,
-        .regular => c.FC_WEIGHT_REGULAR,
-        .normal => c.FC_WEIGHT_NORMAL,
-        .medium => c.FC_WEIGHT_MEDIUM,
-        .demibold => c.FC_WEIGHT_DEMIBOLD,
-        .semibold => c.FC_WEIGHT_SEMIBOLD,
-        .bold => c.FC_WEIGHT_BOLD,
-        .extrabold => c.FC_WEIGHT_EXTRABOLD,
-        .ultrabold => c.FC_WEIGHT_ULTRABOLD,
-        .black => c.FC_WEIGHT_BLACK,
-        .heavy => c.FC_WEIGHT_HEAVY,
-        .extrablack => c.FC_WEIGHT_EXTRABLACK,
-        .ultrablack => c.FC_WEIGHT_ULTRABLACK,
-    });
-
-    if (key.italic) {
-        _ = c.FcPatternAddInteger(fc_pattern, c.FC_SLANT, c.FC_SLANT_ITALIC);
-    }
-
-    if (key.codepoint != 0) {
-        const charset = c.FcCharSetCreate();
-        if (key.codepoint) |codepoint| {
-            _ = c.FcCharSetAddChar(charset, codepoint);
-        }
-        _ = c.FcPatternAddCharSet(fc_pattern, c.FC_CHARSET, charset);
-    }
-
-    _ = c.FcConfigSubstitute(null, fc_pattern, c.FcMatchPattern);
-    c.FcDefaultSubstitute(fc_pattern);
-
-    return fc_pattern;
-}
-
-fn createFtFace(self: *Self, fc_font: ?*c.FcPattern, key: FontKey) error{InvalidFont}!c.FT_Face {
-    var fc_path: [*c]u8 = undefined;
-    if (c.FcPatternGetString(fc_font, c.FC_FILE, 0, &fc_path) != c.FcResultMatch) {
-        return error.InvalidFont;
-    }
-
-    var index: i32 = undefined;
-    if (c.FcPatternGetInteger(fc_font, c.FC_INDEX, 0, &index) != c.FcResultMatch) {
-        return error.InvalidFont;
-    }
-
-    var ft_face: c.FT_Face = undefined;
-    if (c.FT_New_Face(self.ft, fc_path, index, &ft_face) != 0) {
-        return error.InvalidFont;
-    }
-    if (ft_face.*.num_fixed_sizes > 0 and !c.FT_IS_SCALABLE(ft_face)) {
-        var best: c_int = 0;
-        var best_diff = @abs(ft_face.*.available_sizes[0].height - key.size);
-        for (1..@intCast(ft_face.*.num_fixed_sizes)) |i| {
-            const h = ft_face.*.available_sizes[i].height;
-            const diff = @abs(h - key.size);
-            if (diff < best_diff) {
-                best = @intCast(i);
-                best_diff = diff;
-            }
-        }
-        _ = c.FT_Select_Size(ft_face, best);
-    } else {
-        _ = c.FT_Set_Pixel_Sizes(ft_face, 0, key.size);
-    }
-
-    return ft_face;
-}
-
-const GetGlyphError = error{ GlyphNotFound, GlyphNotRendered, GlyphTooLarge, UnsupportedPixelMode } ||
-    GetFontError;
-
-pub fn getGlyph(self: *Self, font: *Font, codepoint: u32) GetGlyphError!Glyph {
-    const key = GlyphKey{ .path = font.path, .codepoint = codepoint };
-    if (self.cache_map.get(key)) |glyph| return glyph;
-
-    if (c.FT_Load_Glyph(font.ft_face, codepoint, c.FT_LOAD_DEFAULT | c.FT_LOAD_COLOR) != 0) {
-        return error.GlyphNotFound;
-    }
-    const slot = font.ft_face.*.glyph;
-    if (c.FT_Render_Glyph(slot, c.FT_RENDER_MODE_NORMAL) != 0) {
-        return error.GlyphNotRendered;
-    }
-
-    const bitmap = slot.*.bitmap;
-    const width: u32 = @intCast(bitmap.width);
-    const height: u32 = @intCast(bitmap.rows);
-    const pitch: usize = @intCast(bitmap.pitch);
-    const top: i32 = applyFontScaleFactor(font, slot.*.bitmap_top);
-    const left: i32 = applyFontScaleFactor(font, slot.*.bitmap_left);
-
-    if (width == 0 or height == 0) {
-        const glyph = Glyph{ .render_mode = .none, .rect = .{}, .top = 0, .left = 0 };
-        try self.cache_map.put(key, glyph);
-        return glyph;
-    }
-
-    const rect = try self.packRect(applyFontScaleFactor(font, width), applyFontScaleFactor(font, height));
-    var glyph = Glyph{
-        .render_mode = .none,
-        .rect = rect,
-        .top = @intCast(top),
-        .left = @intCast(left),
-    };
-
-    switch (bitmap.pixel_mode) {
-        c.FT_PIXEL_MODE_BGRA => self.copyColorGlyphToAtlas(
-            @ptrCast(@alignCast(bitmap.buffer)),
-            width,
-            height,
-            font.scale_factor,
-            &glyph,
-        ),
-        c.FT_PIXEL_MODE_GRAY => self.copyGrayGlyphToAtlas(bitmap.buffer, width, height, &glyph),
-        c.FT_PIXEL_MODE_MONO => self.copyMonoGlyphToAtlas(bitmap.buffer, width, height, pitch, &glyph),
-        else => return error.UnsupportedPixelMode,
-    }
-
-    try self.cache_map.put(key, glyph);
-    return glyph;
-}
-
-inline fn applyFontScaleFactor(font: *Font, value: anytype) @TypeOf(value) {
-    const T = @TypeOf(value);
-    return switch (@typeInfo(T)) {
-        .int => @intFromFloat(@as(f64, @floatFromInt(value)) * font.scale_factor),
-        .float => value * font.scale_factor,
-        else => @compileError("Invalid Error"),
-    };
-}
-
-fn packRect(self: *Self, width: u32, height: u32) error{GlyphTooLarge}!Rect {
-    var rect: c.stbrp_rect = .{
-        .w = @intCast(width),
-        .h = @intCast(height),
-    };
-    _ = c.stbrp_pack_rects(self.cache_ctx, &rect, 1);
-    if (rect.was_packed == 0) {
-        c.stbrp_init_target(
-            self.cache_ctx,
-            @intCast(atlas_width),
-            @intCast(atlas_height),
-            self.cache_nodes.ptr,
-            @intCast(self.cache_nodes.len),
-        );
-        self.cache_map.clearRetainingCapacity();
-        _ = c.stbrp_pack_rects(self.cache_ctx, &rect, 1);
-        log.warn("Glyph cache is full, cleared", .{});
-        if (rect.was_packed == 0) return error.GlyphTooLarge;
-    }
-    return .{
-        .x = @intCast(rect.x),
-        .y = @intCast(rect.y),
-        .width = @intCast(rect.w),
-        .height = @intCast(rect.h),
-    };
-}
-
-fn copyColorGlyphToAtlas(
-    self: *Self,
-    buf: [*]u32,
-    width: u32,
-    height: u32,
-    scale_factor: f64,
-    glyph: *Glyph,
-) void {
-    glyph.render_mode = .color;
-
-    const src = c.pixman_image_create_bits_no_clear(
-        c.PIXMAN_a8r8g8b8,
-        @intCast(width),
-        @intCast(height),
-        buf,
-        calcStride(@intCast(width), 32),
-    );
-    defer _ = c.pixman_image_unref(src);
-
-    setScale(src, scale_factor);
-
-    c.pixman_image_composite32(
-        c.PIXMAN_OP_SRC,
-        src,
-        null,
-        self.cache_atlas,
-        0,
-        0,
-        0,
-        0,
-        glyph.rect.x,
-        glyph.rect.y,
-        @intCast(glyph.rect.width),
-        @intCast(glyph.rect.height),
-    );
-}
-
-fn setScale(src: ?*c.pixman_image, scale_factor: f64) void {
-    var scale: c.pixman_transform = undefined;
-    const inv_scale_factor = doubleToFixed(1 / scale_factor);
-    c.pixman_transform_init_scale(&scale, inv_scale_factor, inv_scale_factor);
-    _ = c.pixman_image_set_transform(src, &scale);
-    const kernel = c.PIXMAN_KERNEL_BOX;
-    var n_values: i32 = undefined;
-    const values = c.pixman_filter_create_separable_convolution(
-        &n_values,
-        inv_scale_factor,
-        inv_scale_factor,
-        kernel,
-        kernel,
-        kernel,
-        kernel,
-        1,
-        1,
-    );
-    defer c.free(values);
-    _ = c.pixman_image_set_filter(
-        src,
-        c.PIXMAN_FILTER_SEPARABLE_CONVOLUTION,
-        values,
-        n_values,
-    );
-}
-
-fn copyGrayGlyphToAtlas(self: *Self, buf: [*]u8, width: u32, height: u32, glyph: *Glyph) void {
-    glyph.render_mode = .gray;
-    const stride: usize = @intCast(calcStride(@intCast(width), 8));
-    var tmp_buf: [256 * 256]u8 = undefined;
-    for (0..@intCast(height)) |y| {
-        for (0..@intCast(width)) |x| {
-            tmp_buf[y * stride + x] = buf[y * @as(usize, @intCast(width)) + x];
-        }
-    }
-    const src = c.pixman_image_create_bits_no_clear(
-        c.PIXMAN_a8,
-        @intCast(width),
-        @intCast(height),
-        @ptrCast(@alignCast(&tmp_buf)),
-        @intCast(stride),
-    );
-    defer _ = c.pixman_image_unref(src);
-
-    c.pixman_image_composite32(
-        c.PIXMAN_OP_SRC,
-        src,
-        null,
-        self.cache_atlas,
-        0,
-        0,
-        0,
-        0,
-        glyph.rect.x,
-        glyph.rect.y,
-        @intCast(glyph.rect.width),
-        @intCast(glyph.rect.height),
-    );
-}
-
-fn copyMonoGlyphToAtlas(self: *Self, buf: [*]u8, width: u32, height: u32, pitch: usize, glyph: *Glyph) void {
-    glyph.render_mode = .mono;
-
-    const stride: usize = @intCast(calcStride(@intCast(width), 8));
-    var tmp_buf: [256 * 256]u8 = undefined;
-    for (0..@intCast(height)) |y| {
-        for (0..@intCast(width)) |x| {
-            const value = buf[y * pitch + x];
-            tmp_buf[y * stride + x] = @bitReverse(value);
-        }
-    }
-    const src = c.pixman_image_create_bits_no_clear(
-        c.PIXMAN_a1,
-        @intCast(width),
-        @intCast(height),
-        @ptrCast(@alignCast(&tmp_buf)),
-        @intCast(stride),
-    );
-    defer _ = c.pixman_image_unref(src);
-
-    c.pixman_image_composite32(
-        c.PIXMAN_OP_SRC,
-        src,
-        null,
-        self.cache_atlas,
-        0,
-        0,
-        0,
-        0,
-        glyph.rect.x,
-        glyph.rect.y,
-        @intCast(glyph.rect.width),
-        @intCast(glyph.rect.height),
-    );
 }
 
 inline fn doubleToFixed(d: f64) c.pixman_fixed_t {
@@ -970,5 +1055,14 @@ inline fn argbToColor(color: ARGB) c.pixman_color_t {
         .red = @as(u16, @intCast(color.r)) << 8,
         .green = @as(u16, @intCast(color.g)) << 8,
         .blue = @as(u16, @intCast(color.b)) << 8,
+    };
+}
+
+inline fn applyFontScaleFactor(font: *Font, value: anytype) @TypeOf(value) {
+    const T = @TypeOf(value);
+    return switch (@typeInfo(T)) {
+        .int => @intFromFloat(@as(f64, @floatFromInt(value)) * font.scale_factor),
+        .float => value * font.scale_factor,
+        else => @compileError("Invalid value"),
     };
 }

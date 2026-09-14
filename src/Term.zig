@@ -29,10 +29,16 @@ pub const Style = struct {
         }
     };
 
+    pub const Blink = enum {
+        static,
+        slow,
+        fast,
+    };
+
     bold: bool = false,
     dim: bool = false,
     italic: bool = false,
-    blink: bool = false,
+    blink: Blink = .static,
     inverse: bool = false,
     hidden: bool = false,
     underline: Underline = .{},
@@ -89,6 +95,7 @@ const Cell = struct {
 const Row = struct {
     cells: []Cell = undefined,
     len: usize = 0,
+    dirty: bool = true,
     wrapped: bool = false,
 
     pub fn init(allocator: std.mem.Allocator, capacity: usize) !Row {
@@ -102,6 +109,7 @@ const Row = struct {
     }
 
     pub fn insert(self: *Row, index: usize, bytes: []const u8, char_width: u32) void {
+        self.dirty = true;
         const start = index;
         const end = index + char_width;
         std.debug.assert(end <= self.cells.len);
@@ -124,6 +132,7 @@ const Row = struct {
 
     pub fn scrollLeft(self: *Row, index: usize, amount: usize) !void {
         std.debug.assert(index < self.cells.len);
+        self.dirty = true;
         if (index >= self.len) return;
 
         const dest_start = @min(index + amount, self.cells.len);
@@ -147,6 +156,7 @@ const Row = struct {
 
     pub fn delete(self: *Row, index: usize, amount: usize) void {
         std.debug.assert(index < self.cells.len);
+        self.dirty = true;
         if (index >= self.len) return;
         const real_amount = @min(self.len - index, amount);
 
@@ -167,12 +177,14 @@ const Row = struct {
 
     pub fn eraseBegin(self: *Row, index: usize) void {
         std.debug.assert(index < self.cells.len);
+        self.dirty = true;
         self.clearMultiCellChar(index);
         @memset(self.cells[0 .. index + 1], Cell.empty());
     }
 
     pub fn eraseEnd(self: *Row, index: usize) void {
         std.debug.assert(index < self.cells.len);
+        self.dirty = true;
         if (index >= self.len) return;
         self.clearMultiCellChar(index);
         @memset(self.cells[index..], Cell.empty());
@@ -181,8 +193,8 @@ const Row = struct {
     }
 
     pub fn eraseAll(self: *Row) void {
+        self.dirty = true;
         @memset(self.cells, Cell.empty());
-
         self.len = 0;
     }
 
@@ -213,30 +225,52 @@ allocator: std.mem.Allocator,
 
 width: usize,
 height: usize,
+cell_width: usize,
+cell_height: usize,
+
+render: *Render,
+image: Render.Image,
+
 style: Style = .{},
+
 cursor: Cursor = .{},
 dec_cursor: Cursor = .{},
 sco_cursor: Cursor = .{},
-rows: AllocQueue(Row),
+
+screen: AllocQueue(Row),
 scrollback: AllocQueue(Row),
+
 need_redraw: bool = false,
 
-pub fn init(allocator: std.mem.Allocator, width: usize, height: usize) !Term {
+pub fn init(
+    allocator: std.mem.Allocator,
+    render: *Render,
+    width: usize,
+    height: usize,
+    cell_width: usize,
+    cell_height: usize,
+) !Term {
     var self = Term{
         .allocator = allocator,
-        .rows = try .init(allocator, height),
+        .render = render,
+        .image = try render.createImage(cell_width * width, cell_height * height),
+        .screen = try .init(allocator, height),
         .scrollback = try .init(allocator, scrollback_capacity),
         .width = width,
         .height = height,
+        .cell_width = cell_width,
+        .cell_height = cell_height,
     };
-    while (!self.rows.isFull()) {
-        self.rows.putBack(try .init(allocator, width)) catch unreachable;
+    try self.render.fill(self.image, @bitCast(@as(u32, 0xFF101010)));
+    while (!self.screen.isFull()) {
+        self.screen.putBack(try .init(allocator, width)) catch unreachable;
     }
     return self;
 }
 
 pub fn deinit(self: *Term) void {
-    var iter = self.rows.iterator();
+    self.render.destroyImage(self.image) catch unreachable;
+    var iter = self.screen.iterator();
     while (iter.next()) |row| {
         row.deinit(self.allocator);
     }
@@ -245,7 +279,7 @@ pub fn deinit(self: *Term) void {
         row.deinit(self.allocator);
     }
     self.scrollback.deinit();
-    self.rows.deinit();
+    self.screen.deinit();
 }
 
 const WindowIterator = struct {
@@ -284,92 +318,190 @@ const WindowIterator = struct {
     }
 };
 
-pub fn resize(self: *Term, width: usize, height: usize) !void {
-    var old_rows = self.rows;
-    defer {
-        var iter = old_rows.iterator();
-        while (iter.next()) |row| {
-            row.deinit(self.allocator);
+const RowIterator = struct {
+    const Result = struct {
+        row: *Row,
+        cursor_offset: ?usize = null,
+        dec_cursor_offset: ?usize = null,
+        sco_cursor_offset: ?usize = null,
+    };
+
+    cursor: Cursor,
+    dec_cursor: Cursor,
+    sco_cursor: Cursor,
+    screen_iter: AllocQueue(Row).Iterator,
+    scrollback_iter: AllocQueue(Row).Iterator,
+    i: usize = 0,
+
+    pub fn init(self: *RowIterator, term: *const Term) void {
+        self.* = .{
+            .cursor = term.cursor,
+            .dec_cursor = term.dec_cursor,
+            .sco_cursor = term.sco_cursor,
+            .screen_iter = term.screen.iterator(),
+            .scrollback_iter = term.scrollback.iterator(),
+        };
+    }
+
+    pub fn next(self: *RowIterator) ?Result {
+        if (self.scrollback_iter.next()) |row| {
+            return .{ .row = row };
         }
-        old_rows.deinit();
+        if (self.screen_iter.next()) |row| {
+            const result = Result{
+                .row = row,
+                .cursor_offset = if (self.i == self.cursor.y) self.cursor.x else null,
+                .dec_cursor_offset = if (self.i == self.dec_cursor.y) self.dec_cursor.x else null,
+                .sco_cursor_offset = if (self.i == self.sco_cursor.y) self.sco_cursor.x else null,
+            };
+            self.i += 1;
+            return result;
+        }
+        return null;
+    }
+};
+
+const VirtualRow = struct {
+    cells: std.ArrayList(Cell) = .empty,
+    wrapped: bool = false,
+    cursor_offset: ?usize = null,
+    dec_cursor_offset: ?usize = null,
+    sco_cursor_offset: ?usize = null,
+
+    pub fn toRow(self: *const VirtualRow, allocator: std.mem.Allocator, width: usize) !Row {
+        var row = try Row.init(allocator, width);
+        @memcpy(row.cells[0..self.cells.items.len], self.cells.items);
+        row.wrapped = self.wrapped;
+        row.len = self.cells.items.len;
+        row.dirty = true;
+        return row;
     }
 
+    pub fn clear(self: *VirtualRow) void {
+        self.cells.clearRetainingCapacity();
+        self.wrapped = false;
+        self.cursor_offset = null;
+        self.dec_cursor_offset = null;
+        self.sco_cursor_offset = null;
+    }
+};
+
+pub fn resize(self: *Term, width: usize, height: usize) !void {
     self.need_redraw = true;
-    self.rows = try AllocQueue(Row).init(self.allocator, height);
-    while (!self.rows.isFull()) {
-        self.rows.putBack(try .init(self.allocator, width)) catch unreachable;
-    }
 
-    var new_cursor: ?Cursor = null;
-    var cursor_offset: ?usize = null;
-    var accum: std.ArrayList(Cell) = .empty;
-    defer accum.deinit(self.allocator);
+    self.render.destroyImage(self.image) catch unreachable;
+    self.image = try self.render.createImage(self.cell_width * width, self.cell_height * height);
+    try self.render.fill(self.image, @bitCast(@as(u32, 0xFF101010)));
 
-    var new_row_index: usize = 0;
-    for (0..self.height) |old_row_index| {
-        const old_row = old_rows.getPtr(old_row_index).?;
-        if (old_row_index == self.cursor.y) {
-            cursor_offset = accum.items.len + self.cursor.x;
+    var iter: RowIterator = undefined;
+    iter.init(self);
+
+    var virtual_row: VirtualRow = .{};
+    defer virtual_row.cells.deinit(self.allocator);
+    var rows: std.ArrayList(VirtualRow) = .empty;
+    defer rows.deinit(self.allocator);
+
+    while (iter.next()) |result| {
+        const old_row = result.row;
+        if (result.cursor_offset) |offset| {
+            virtual_row.cursor_offset = virtual_row.cells.items.len + offset;
         }
         if (old_row.wrapped) {
-            try accum.appendSlice(self.allocator, old_row.cells[0..old_row.len]);
+            try virtual_row.cells.appendSlice(self.allocator, old_row.cells[0..old_row.len]);
         } else if (old_row.len == 0) {
-            new_row_index = @min(height, new_row_index + 1);
+            try rows.append(self.allocator, .{});
         } else {
-            try accum.appendSlice(self.allocator, old_row.cells[0..old_row.len]);
-            var window_iter = WindowIterator.init(accum.items, width);
+            try virtual_row.cells.appendSlice(self.allocator, old_row.cells[0..old_row.len]);
+            var window_iter = WindowIterator.init(virtual_row.cells.items, width);
             var window_index: usize = 0;
             while (window_iter.next()) |window| : (window_index += 1) {
                 if (window_index > 0) {
-                    self.rows.getPtr(new_row_index - 1).?.wrapped = true;
+                    rows.items[rows.items.len - 1].wrapped = true;
                 }
-                if (new_row_index >= height) {
-                    try self.scroll();
-                    if (new_cursor) |*nc| {
-                        nc.y -|= 1;
-                    }
-                    new_row_index -= 1;
-                }
-                var new_row = self.rows.getPtr(new_row_index).?;
-                @memcpy(new_row.cells[0..window.cells.len], window.cells);
-                new_row.len = window.cells.len;
-                new_row_index += 1;
+
+                var new_row = VirtualRow{};
+                try new_row.cells.appendSlice(self.allocator, window.cells);
 
                 const window_start = window.offset;
                 const window_end = window_start + width;
 
-                if (cursor_offset) |offset| {
+                if (virtual_row.cursor_offset) |offset| {
                     if (offset >= window_start and offset < window_end) {
-                        const x = offset - window_start;
-                        new_cursor = .{
-                            .x = x,
-                            .y = new_row_index - 1,
-                            .wrap_pending = self.cursor.wrap_pending and x == width - 1,
-                        };
+                        new_row.cursor_offset = offset - window_start;
                     }
                 }
+
+                try rows.append(self.allocator, new_row);
             }
-            accum.clearRetainingCapacity();
+            virtual_row.clear();
         }
+    }
+
+    while (rows.getLastOrNull()) |row| {
+        if (row.cells.items.len != 0) break;
+        var removed = rows.pop().?;
+        removed.cells.deinit(self.allocator);
+    }
+
+    const screen_start = rows.items.len -| height;
+    const scrollback_slice = rows.items[0..screen_start];
+    const screen_slice = rows.items[screen_start..];
+
+    var queue_iter = self.scrollback.iterator();
+    while (queue_iter.next()) |row| {
+        row.deinit(self.allocator);
+    }
+    self.scrollback.deinit();
+
+    queue_iter = self.screen.iterator();
+    while (queue_iter.next()) |row| {
+        row.deinit(self.allocator);
+    }
+    self.screen.deinit();
+
+    self.scrollback = try .init(self.allocator, scrollback_capacity);
+    for (scrollback_slice) |*current_virtual_row| {
+        if (self.scrollback.isFull()) {
+            const removed = self.scrollback.takeFront().?;
+            removed.deinit(self.allocator);
+        }
+        self.scrollback.putBack(try current_virtual_row.toRow(self.allocator, width)) catch unreachable;
+        current_virtual_row.cells.deinit(self.allocator);
+    }
+
+    self.screen = try .init(self.allocator, height);
+    for (screen_slice, 0..) |*current_virtual_row, y| {
+        if (current_virtual_row.cursor_offset) |x| {
+            self.cursor = .{
+                .x = x,
+                .y = y,
+                .wrap_pending = self.cursor.wrap_pending and x == width - 1,
+            };
+        }
+        self.screen.putBack(try current_virtual_row.toRow(self.allocator, width)) catch unreachable;
+        current_virtual_row.cells.deinit(self.allocator);
+    }
+    while (!self.screen.isFull()) {
+        self.screen.putBack(try .init(self.allocator, width)) catch unreachable;
     }
 
     self.width = width;
     self.height = height;
-    self.cursor = new_cursor orelse .{
-        .x = @min(self.cursor.x, width - 1),
-        .y = @min(self.cursor.y, height - 1),
-        .wrap_pending = self.cursor.wrap_pending and @min(self.cursor.x, width - 1) == width - 1,
-    };
 }
 
 fn scroll(self: *Term) !void {
-    if (self.rows.takeFront()) |row| {
+    if (self.screen.takeFront()) |row| {
         if (self.scrollback.isFull()) {
             const deleted = self.scrollback.takeBack().?;
             deleted.deinit(self.allocator);
         }
         self.scrollback.putBack(row) catch unreachable;
-        self.rows.putBack(try .init(self.allocator, self.width)) catch unreachable;
+        self.screen.putBack(try .init(self.allocator, self.width)) catch unreachable;
+        var iter = self.screen.iterator();
+        while (iter.next()) |current| {
+            current.dirty = true;
+        }
+        self.need_redraw = true;
     }
 }
 
@@ -390,7 +522,7 @@ pub fn carriageReturn(self: *Term) void {
 pub fn insert(self: *Term, bytes: []const u8, char_width: u32) !void {
     self.need_redraw = true;
     if (self.cursor.wrap_pending or self.width - self.cursor.x < char_width) {
-        if (self.rows.getPtr(self.cursor.y)) |row| {
+        if (self.screen.getPtr(self.cursor.y)) |row| {
             row.wrapped = true;
         }
         const y = self.cursor.y + 1;
@@ -400,7 +532,7 @@ pub fn insert(self: *Term, bytes: []const u8, char_width: u32) !void {
         self.setCursor(0, y, false);
     }
 
-    const row = self.rows.getPtr(self.cursor.y).?;
+    const row = self.screen.getPtr(self.cursor.y).?;
     row.insert(self.cursor.x, bytes, char_width);
 
     const x = self.cursor.x + char_width;
@@ -409,16 +541,16 @@ pub fn insert(self: *Term, bytes: []const u8, char_width: u32) !void {
 }
 
 pub fn scrollLeft(self: *Term, amount: usize) !void {
-    if (self.rows.len <= self.cursor.y) return;
+    if (self.screen.len <= self.cursor.y) return;
     self.need_redraw = true;
-    const row = self.rows.getPtr(self.cursor.y).?;
+    const row = self.screen.getPtr(self.cursor.y).?;
     try row.scrollLeft(self.cursor.x, amount);
 }
 
 pub fn delete(self: *Term, amount: usize) !void {
-    if (self.rows.len <= self.cursor.y) return;
+    if (self.screen.len <= self.cursor.y) return;
     self.need_redraw = true;
-    const row = self.rows.getPtr(self.cursor.y).?;
+    const row = self.screen.getPtr(self.cursor.y).?;
     row.delete(self.cursor.x, amount);
 }
 
@@ -456,8 +588,10 @@ pub fn moveCursorToColumn(self: *Term, col: usize) void {
 
 pub fn setCursor(self: *Term, x: usize, y: usize, wrap_pending: bool) void {
     self.need_redraw = true;
+    self.screen.getPtr(self.cursor.y).?.dirty = true;
     const cx = std.math.clamp(x, 0, self.width - 1);
     const cy = std.math.clamp(y, 0, self.height - 1);
+    self.screen.getPtr(cy).?.dirty = true;
     self.cursor = .{ .x = cx, .y = cy, .wrap_pending = wrap_pending };
 }
 
@@ -480,12 +614,12 @@ pub fn decRestore(self: *Term) void {
 }
 
 pub fn eraseEndScreen(self: *Term) !void {
-    if (self.rows.len <= self.cursor.y) return;
+    if (self.screen.len <= self.cursor.y) return;
     self.need_redraw = true;
-    var first_row = self.rows.getPtr(self.cursor.y).?;
+    var first_row = self.screen.getPtr(self.cursor.y).?;
     first_row.eraseEnd(self.cursor.x);
-    for (self.cursor.y + 1..self.rows.len) |i| {
-        const row = self.rows.getPtr(i).?;
+    for (self.cursor.y + 1..self.screen.len) |i| {
+        const row = self.screen.getPtr(i).?;
         row.wrapped = false;
         row.eraseAll();
     }
@@ -493,10 +627,10 @@ pub fn eraseEndScreen(self: *Term) !void {
 
 pub fn eraseBeginScreen(self: *Term) !void {
     self.need_redraw = true;
-    var row = self.rows.getPtr(@min(self.cursor.y, self.rows.len - 1)).?;
+    var row = self.screen.getPtr(@min(self.cursor.y, self.screen.len - 1)).?;
     row.eraseBegin(self.cursor.x);
-    for (0..@min(self.cursor.y, self.rows.len)) |i| {
-        row = self.rows.getPtr(i).?;
+    for (0..@min(self.cursor.y, self.screen.len)) |i| {
+        row = self.screen.getPtr(i).?;
         row.wrapped = false;
         row.eraseAll();
     }
@@ -504,7 +638,7 @@ pub fn eraseBeginScreen(self: *Term) !void {
 
 pub fn eraseAllScreen(self: *Term) void {
     self.need_redraw = true;
-    var iter = self.rows.iterator();
+    var iter = self.screen.iterator();
     while (iter.next()) |row| {
         row.wrapped = false;
         row.eraseAll();
@@ -513,7 +647,7 @@ pub fn eraseAllScreen(self: *Term) void {
 
 pub fn eraseAllScreenAndScrollback(self: *Term) void { // TODO:
     self.need_redraw = true;
-    var iter = self.rows.iterator();
+    var iter = self.screen.iterator();
     while (iter.next()) |row| {
         row.wrapped = false;
         row.eraseAll();
@@ -525,60 +659,62 @@ pub fn eraseAllScreenAndScrollback(self: *Term) void { // TODO:
 }
 
 pub fn eraseEndLine(self: *Term) !void {
-    if (self.rows.len <= self.cursor.y) return;
+    if (self.screen.len <= self.cursor.y) return;
     self.need_redraw = true;
-    var row = self.rows.getPtr(self.cursor.y).?;
+    var row = self.screen.getPtr(self.cursor.y).?;
     row.eraseEnd(self.cursor.x);
 }
 
 pub fn eraseBeginLine(self: *Term) !void {
-    if (self.rows.len <= self.cursor.y) return;
+    if (self.screen.len <= self.cursor.y) return;
     self.need_redraw = true;
-    var row = self.rows.getPtr(self.cursor.y).?;
+    var row = self.screen.getPtr(self.cursor.y).?;
     row.eraseBegin(self.cursor.x);
 }
 
 pub fn eraseAllLine(self: *Term) !void {
-    if (self.rows.len <= self.cursor.y) return;
+    if (self.screen.len <= self.cursor.y) return;
     self.need_redraw = true;
-    var row = self.rows.getPtr(self.cursor.y).?;
+    var row = self.screen.getPtr(self.cursor.y).?;
     row.eraseAll();
 }
 
-pub fn draw(
-    self: *Term,
-    allocator: std.mem.Allocator,
-    render: *Render,
-    font: Render.ShapeTextInfo.Font,
-    cell_width: u32,
-    cell_height: u32,
-) !void {
+pub fn draw(self: *Term, allocator: std.mem.Allocator, font: Render.DrawTextInfo.Font) !void {
     self.need_redraw = false;
     var allocating = std.Io.Writer.Allocating.init(allocator);
     var y_offset: i32 = 0;
-    var iter = self.rows.iterator();
+    var iter = self.screen.iterator();
     while (iter.next()) |row| {
-        allocating.clearRetainingCapacity();
-        for (row.cells[0..row.len]) |*cell| {
-            if (cell.kind != .trailing) {
-                try allocating.writer.writeAll(cell.content());
+        if (row.dirty) {
+            allocating.clearRetainingCapacity();
+            row.dirty = false;
+            try self.render.drawRect(self.image, .{
+                .x = 0,
+                .y = y_offset,
+                .width = @intCast(self.width * self.cell_width),
+                .height = @intCast(self.cell_height),
+            }, @bitCast(@as(u32, 0xFF101010)));
+            for (row.cells[0..row.len]) |*cell| {
+                if (cell.kind != .trailing) {
+                    try allocating.writer.writeAll(cell.content());
+                }
+            }
+            const text = allocating.written();
+            if (!std.mem.eql(u8, text, "")) {
+                try self.render.drawText(self.image, .{
+                    .font = font,
+                    .text = text,
+                    .color = @bitCast(@as(u32, 0xFFFFFFFF)),
+                    .start = .{ .x = 0, .y = y_offset },
+                });
             }
         }
-        const text = allocating.written();
-        if (!std.mem.eql(u8, text, "")) {
-            const shaped = try render.allocShapeText(allocator, .{ .font = font, .text = text });
-            try render.drawShappedText(.{
-                .shaped_text = shaped,
-                .color = @bitCast(@as(u32, 0xFFFFFFFF)),
-                .start = .{ .x = 0, .y = y_offset },
-            });
-        }
-        y_offset += @intCast(cell_height);
+        y_offset += @intCast(self.cell_height);
     }
-    try render.drawRect(.{
-        .x = @intCast(self.cursor.x * cell_width),
-        .y = @intCast(self.cursor.y * cell_height),
-        .width = cell_width,
-        .height = cell_height,
+    try self.render.drawRect(self.image, .{
+        .x = @intCast(self.cursor.x * self.cell_width),
+        .y = @intCast(self.cursor.y * self.cell_height),
+        .width = @intCast(self.cell_width),
+        .height = @intCast(self.cell_height),
     }, @bitCast(@as(u32, 0xFFFFFFFF)));
 }

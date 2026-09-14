@@ -28,7 +28,7 @@ pub fn init(self: *Tty, io: std.Io, environ_map: *std.process.Environ.Map, platf
     if (fork == 0) {
         try environ_map.put("TERM", "xterm-256color");
         return std.process.replace(io, .{
-            .argv = &.{"bash"},
+            .argv = &.{environ_map.get("SHELL") orelse "sh"},
             .environ_map = environ_map,
         });
     }
@@ -89,33 +89,6 @@ pub fn readFromMaster(user_data: ?*anyopaque, event_type: Event.Fd.Type) void {
     std.log.debug("readed {d} rest {d}", .{ readed, rest });
     @memmove(self.master_buf[0..rest], self.master_buf[end - rest .. end]);
     self.master_end = rest;
-
-    // var parser: Parser = undefined;
-    // parser.init(&reader, self.term, self.platform);
-    // const rest = parser.parse() catch unreachable;
-    // std.log.debug("rest {d}", .{rest});
-    // const len = readed + self.master_end;
-    // const text = self.master_buf[0..len];
-    // var iter = unicode.GraphemeIter{ .text = text };
-    // var current_opt: ?unicode.GraphemeIter.Result = null;
-    // self.master_end = 0;
-    // while (true) {
-    //     if (current_opt) |current| {
-    //         self.term.insert(text[current.index .. current.index + current.len]) catch {};
-    //     }
-    //     current_opt = iter.next() catch {
-    //         if (current_opt) |current| {
-    //             for (text[current.index..], 0..) |byte, i| {
-    //                 self.master_buf[i] = byte;
-    //                 self.master_end = i;
-    //             }
-    //             self.master_end += 1;
-    //         }
-    //         current_opt = null;
-    //         break;
-    //     };
-    //     if (current_opt == null) break;
-    // }
 }
 
 fn drain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {

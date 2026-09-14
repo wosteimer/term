@@ -140,21 +140,25 @@ pub fn main(init: std.process.Init) !void {
     platform.enableTextInput();
     platform.enableKeyboardRepeat();
 
-    var term = try Term.init(init.gpa, 80, 24);
+    var render = try Render.init(init.gpa, &platform);
+    defer render.deinit();
+
+    const font_metrics = try render.getFontMetrics(.{ .name = "JetBrains Mono", .size = 16 });
+    const cell_width: u32 = @intCast(font_metrics.max_advance);
+    const cell_height: u32 = @intCast(font_metrics.height);
+
+    var term = try Term.init(init.gpa, &render, 80, 24, cell_width, cell_height);
     defer term.deinit();
 
     var tty: Tty = undefined;
     try tty.init(init.io, init.environ_map, &platform, &term);
 
-    var render = try Render.init(init.gpa, &platform);
-    defer render.deinit();
-
-    const font: Render.ShapeTextInfo.Font = .{
+    const font: Render.DrawTextInfo.Font = .{
         .name = "JetBrains Mono",
         .size = 16,
         .monospace = true,
     };
-    const font_metrics = try render.getFontMetrics(.{ .name = "JetBrains Mono", .size = 16 });
+
     const background: u32 = 0xFF101010;
     // const foreground: u32 = 0xFFFFFFFF;
 
@@ -195,16 +199,23 @@ pub fn main(init: std.process.Init) !void {
                 else => {},
             }
         }
-        if (term.need_redraw and render.startDraw()) {
-            defer render.endDraw() catch {};
-            try render.fill(@bitCast(background));
-            try term.draw(
-                scratch_alloc.allocator(),
-                &render,
-                font,
-                @intCast(font_metrics.max_advance),
-                @intCast(font_metrics.height),
-            );
+        if (term.need_redraw) {
+            if (try render.startDraw()) |image| {
+                defer render.endDraw(image) catch {};
+                try render.fill(image, @bitCast(background));
+                try term.draw(scratch_alloc.allocator(), font);
+                try render.drawImage(
+                    image,
+                    term.image,
+                    .{},
+                    .{
+                        .x = 0,
+                        .y = 0,
+                        .width = @intCast(term.width * term.cell_width),
+                        .height = @intCast(term.height * term.cell_height),
+                    },
+                );
+            }
         }
     }
 }
