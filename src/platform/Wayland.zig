@@ -180,7 +180,12 @@ xkb_compose_state: ?*c.xkb_compose_state = null,
 zxdg_decoration_manager_v1: ?*c.zxdg_decoration_manager_v1 = null,
 zxdg_toplevel_decoration_v1: ?*c.zxdg_toplevel_decoration_v1 = null,
 
+wp_tearing_control_manager_v1: ?*c.wp_tearing_control_manager_v1 = null,
+wp_tearing_control_v1: ?*c.wp_tearing_control_v1 = null,
+
 events: Queue(Event, 256) = .empty,
+clk_id: std.os.linux.clockid_t = @enumFromInt(0),
+next_refresh: u64 = 0,
 resize_pending: bool = false,
 title: [4096:0]u8 = .{0} ** 4096,
 width: u32 = 200,
@@ -235,6 +240,13 @@ pub fn init(self: *Self, allocator: std.mem.Allocator) void {
         );
     } else {
         log.warn("xdg toplevel decoration protocol not supported", .{});
+    }
+
+    if (self.wp_tearing_control_manager_v1) |wp_tearing_control_manager_v1| {
+        self.wp_tearing_control_v1 = c.wp_tearing_control_manager_v1_get_tearing_control(
+            wp_tearing_control_manager_v1,
+            self.wl_surface,
+        );
     }
 
     _ = c.xdg_surface_add_listener(self.xdg_surface, &xdg_surface_listener, self);
@@ -333,8 +345,26 @@ fn cleanup(cleanupFn: anytype, ptr_to_opt_ptr: anytype, extra_args: anytype) voi
     }
 }
 
+const wl_callback_listener = c.wl_callback_listener{
+    .done = wlCallbackDone,
+};
+
+fn wlCallbackDone(user_data: ?*anyopaque, wl_callback: ?*c.wl_callback, callback_data: u32) callconv(.c) void {
+    _ = callback_data;
+    const self: *Self = @ptrCast(@alignCast(user_data));
+
+    self.events.put(.{ .frame = {} }) catch {
+        log.warn("Event queue full, a frame discarted event missed", .{});
+    };
+
+    c.wl_callback_destroy(wl_callback);
+}
+
 pub fn present(self: *Self) void {
     if (self.pending_present) |buffer| {
+        const callback = c.wl_surface_frame(self.wl_surface);
+        _ = c.wl_callback_add_listener(callback, &wl_callback_listener, self);
+
         c.wl_surface_attach(self.wl_surface, buffer.wl_buffer, 0, 0);
         c.wl_surface_damage(self.wl_surface, 0, 0, std.math.maxInt(i32), std.math.maxInt(i32));
         c.wl_surface_commit(self.wl_surface);
@@ -382,6 +412,30 @@ pub fn setFullscreen(self: *Self) void {
 
 pub fn unsetFullscreen(self: *Self) void {
     c.xdg_toplevel_unset_fullscreen(self.xdg_toplevel);
+}
+
+pub fn setVsync(self: *Self) void {
+    if (self.wp_tearing_control_v1) |wp_tearing_control_v1| {
+        c.wp_tearing_control_v1_set_presentation_hint(
+            wp_tearing_control_v1,
+            c.WP_TEARING_CONTROL_V1_PRESENTATION_HINT_VSYNC,
+        );
+        c.wl_surface_commit(self.wl_surface);
+    } else {
+        log.warn("tearing control v1 protocol not supported", .{});
+    }
+}
+
+pub fn unsetVsync(self: *Self) void {
+    if (self.wp_tearing_control_v1) |wp_tearing_control_v1| {
+        c.wp_tearing_control_v1_set_presentation_hint(
+            wp_tearing_control_v1,
+            c.WP_TEARING_CONTROL_V1_PRESENTATION_HINT_ASYNC,
+        );
+        c.wl_surface_commit(self.wl_surface);
+    } else {
+        log.warn("tearing control v1 protocol not supported", .{});
+    }
 }
 
 pub fn setBorderless(self: *Self) void {
@@ -511,6 +565,15 @@ pub fn pumpEvents(self: *Self) void {
     }
 
     if (wayland_readable) {
+        // var t_spec: std.os.linux.timespec = undefined;
+        // const err = std.os.linux.errno(std.os.linux.clock_gettime(self.clk_id, &t_spec));
+        // std.debug.assert(err == .SUCCESS);
+        // const nsecs = std.time.ns_per_s * t_spec.sec + t_spec.nsec;
+        // if (nsecs >= self.next_refresh) {
+        //     self.events.put(.{ .frame = {} }) catch {
+        //         log.warn("Event queue full, a frame discarted event missed", .{});
+        //     };
+        // }
         _ = c.wl_display_read_events(self.wl_display);
         _ = c.wl_display_dispatch_pending(self.wl_display);
     } else {
@@ -663,14 +726,19 @@ fn wlRegistryGlobal(
         self.wl_seat = @ptrCast(@alignCast(c.wl_registry_bind(wl_registry, name, &c.wl_seat_interface, 9)));
         logging = true;
     } else if (std.mem.eql(u8, std.mem.span(interface), std.mem.span(c.wp_cursor_shape_manager_v1_interface.name))) {
-        self.wp_cursor_shape_manager_v1 = @ptrCast(
-            @alignCast(c.wl_registry_bind(wl_registry, name, &c.wp_cursor_shape_manager_v1_interface, 1)),
-        );
+        self.wp_cursor_shape_manager_v1 = @ptrCast(@alignCast(
+            c.wl_registry_bind(wl_registry, name, &c.wp_cursor_shape_manager_v1_interface, 1),
+        ));
         logging = true;
     } else if (std.mem.eql(u8, std.mem.span(interface), std.mem.span(c.zxdg_decoration_manager_v1_interface.name))) {
-        self.zxdg_decoration_manager_v1 = @ptrCast(
-            @alignCast(c.wl_registry_bind(wl_registry, name, &c.zxdg_decoration_manager_v1_interface, 1)),
-        );
+        self.zxdg_decoration_manager_v1 = @ptrCast(@alignCast(
+            c.wl_registry_bind(wl_registry, name, &c.zxdg_decoration_manager_v1_interface, 1),
+        ));
+        logging = true;
+    } else if (std.mem.eql(u8, std.mem.span(interface), std.mem.span(c.wp_tearing_control_manager_v1_interface.name))) {
+        self.wp_tearing_control_manager_v1 = @ptrCast(@alignCast(
+            c.wl_registry_bind(wl_registry, name, &c.wp_tearing_control_manager_v1_interface, 1),
+        ));
         logging = true;
     }
     if (logging) {
@@ -724,6 +792,10 @@ fn xdgSurfaceConfigure(user_data: ?*anyopaque, xdg_surface: ?*c.xdg_surface, ser
     if (self.wl_shm_pool == null) {
         createBuffers(self);
         self.buffers[0].busy = true;
+
+        const callback = c.wl_surface_frame(self.wl_surface);
+        _ = c.wl_callback_add_listener(callback, &wl_callback_listener, self);
+
         c.wl_surface_attach(self.wl_surface, self.buffers[0].wl_buffer, 0, 0);
         c.wl_surface_damage(self.wl_surface, 0, 0, std.math.maxInt(i32), std.math.maxInt(i32));
         c.wl_surface_commit(self.wl_surface);
@@ -739,6 +811,7 @@ fn xdgSurfaceConfigure(user_data: ?*anyopaque, xdg_surface: ?*c.xdg_surface, ser
         createBuffers(self);
         self.resize_pending = false;
     }
+
     log.debug("xdgSurfaceConfigure", .{});
 }
 

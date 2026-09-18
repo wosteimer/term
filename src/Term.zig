@@ -9,7 +9,7 @@ const log = std.log.scoped(.term);
 
 pub const Term = @This();
 
-const scrollback_capacity = 1024 * 64;
+const scrollback_capacity = 1024 * 8;
 
 pub const Style = struct {
     pub const Underline = struct {

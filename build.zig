@@ -5,7 +5,7 @@ const Backend = enum {
     x11,
 };
 
-pub fn build(b: *std.Build) void {
+pub fn build(b: *std.Build) !void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
@@ -17,6 +17,19 @@ pub fn build(b: *std.Build) void {
 
     const options = b.addOptions();
     options.addOption(Backend, "backend", backend);
+
+    var protocols = std.ArrayList(WaylandProtocol).empty;
+    const wayland_protocols_dir = try b.build_root.handle.openDir(
+        b.graph.io,
+        "wayland-protocols/",
+        .{ .iterate = true },
+    );
+    var iter = wayland_protocols_dir.iterate();
+    while (try iter.next(b.graph.io)) |entry| {
+        if (entry.kind != .file or !std.mem.endsWith(u8, entry.name, ".xml")) continue;
+        const protocol = genWaylandProtocol(b, try b.path("wayland-protocols/").join(b.allocator, entry.name));
+        try protocols.append(b.allocator, protocol);
+    }
 
     const c_translate = b.addTranslateC(.{
         .root_source_file = b.path("src/c.h"),
@@ -34,7 +47,12 @@ pub fn build(b: *std.Build) void {
             c_translate.defineCMacro("LINUX_PLATFORM_WAYLAND", null);
             c_translate.linkSystemLibrary("wayland-client", .{});
             c_translate.linkSystemLibrary("xkbcommon", .{});
-            c_translate.addIncludePath(b.path("deps/wayland-protocols/"));
+
+            const wayland_protocol_headers = b.addWriteFiles();
+            for (protocols.items) |protocol| {
+                _ = wayland_protocol_headers.addCopyFile(protocol.header, protocol.header_name);
+            }
+            c_translate.addIncludePath(wayland_protocol_headers.getDirectory());
         },
         .x11 => {
             c_translate.defineCMacro("LINUX_PLATFORM_X11", null);
@@ -47,10 +65,9 @@ pub fn build(b: *std.Build) void {
     c.addCSourceFile(.{ .file = b.path("deps/utf8proc/utf8proc.c") });
     switch (backend) {
         .wayland => {
-            c.addCSourceFile(.{ .file = b.path("deps/wayland-protocols/wp-cursor-shape-v1.c") });
-            c.addCSourceFile(.{ .file = b.path("deps/wayland-protocols/zwp-tablet-v2.c") });
-            c.addCSourceFile(.{ .file = b.path("deps/wayland-protocols/xdg-shell.c") });
-            c.addCSourceFile(.{ .file = b.path("deps/wayland-protocols/zxdg-decoration-v1.c") });
+            for (protocols.items) |protocol| {
+                c.addCSourceFile(.{ .file = protocol.source });
+            }
         },
         .x11 => {},
     }
@@ -116,4 +133,32 @@ pub fn build(b: *std.Build) void {
 
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_exe_tests.step);
+}
+
+const WaylandProtocol = struct {
+    source_name: []const u8,
+    header_name: []const u8,
+    source: std.Build.LazyPath,
+    header: std.Build.LazyPath,
+};
+
+fn genWaylandProtocol(b: *std.Build, protocol_xml_path: std.Build.LazyPath) WaylandProtocol {
+    const name = std.mem.cutSuffix(u8, std.Io.Dir.path.basename(protocol_xml_path.getDisplayName()), ".xml").?;
+
+    const source_name = b.fmt("{s}.c", .{name});
+    const source = b.addSystemCommand(&.{ "wayland-scanner", "private-code" });
+    source.addFileArg(protocol_xml_path);
+    const source_file = source.addOutputFileArg(source_name);
+
+    const header_name = b.fmt("{s}.h", .{name});
+    const header = b.addSystemCommand(&.{ "wayland-scanner", "client-header" });
+    header.addFileArg(protocol_xml_path);
+    const header_file = header.addOutputFileArg(header_name);
+
+    return .{
+        .header_name = header_name,
+        .source_name = source_name,
+        .source = source_file,
+        .header = header_file,
+    };
 }

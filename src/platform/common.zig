@@ -133,6 +133,7 @@ pub const Event = union(enum) {
     pub const PointerWheel = struct { x: f32, y: f32 };
 
     window_close_requested: void,
+    frame: void,
     window_resized: WindowResized,
     keyboard_key_down: KeyboardKey,
     keyboard_key_up: KeyboardKey,

@@ -1,11 +1,12 @@
 #ifdef LINUX_PLATFORM_WAYLAND
+#include <cursor-shape-v1.h>
 #include <linux/input-event-codes.h>
+#include <tearing-control-v1.h>
 #include <wayland-client.h>
-#include <wp-cursor-shape-v1-client.h>
-#include <xdg-shell-client.h>
+#include <xdg-decoration-unstable-v1.h>
+#include <xdg-shell.h>
 #include <xkbcommon/xkbcommon-compose.h>
 #include <xkbcommon/xkbcommon.h>
-#include <zxdg-decoration-v1-client.h>
 #endif // LINUX_PLATFORM_WAYLAND
 
 #ifdef LINUX_PLATFORM_X11

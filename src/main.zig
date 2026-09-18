@@ -19,6 +19,15 @@ const log = std.log.scoped(.main);
 
 const esc = "\x1B";
 
+const background: u32 = 0xFF101010;
+const foreground: u32 = 0xFFFFFFFF;
+
+const font: Render.DrawTextInfo.Font = .{
+    .name = "JetBrains Mono",
+    .size = 16,
+    .monospace = true,
+};
+
 const Escape = struct {
     pub const Modifier = enum(u8) {
         none = 1,
@@ -153,15 +162,6 @@ pub fn main(init: std.process.Init) !void {
     var tty: Tty = undefined;
     try tty.init(init.io, init.environ_map, &platform, &term);
 
-    const font: Render.DrawTextInfo.Font = .{
-        .name = "JetBrains Mono",
-        .size = 16,
-        .monospace = true,
-    };
-
-    const background: u32 = 0xFF101010;
-    // const foreground: u32 = 0xFFFFFFFF;
-
     var scratch_alloc = std.heap.ArenaAllocator.init(init.gpa);
     defer scratch_alloc.deinit();
 
@@ -200,23 +200,27 @@ pub fn main(init: std.process.Init) !void {
             }
         }
         if (term.need_redraw) {
-            if (try render.startDraw()) |image| {
-                defer render.endDraw(image) catch {};
-                try render.fill(image, @bitCast(background));
-                try term.draw(scratch_alloc.allocator(), font);
-                try render.drawImage(
-                    image,
-                    term.image,
-                    .{},
-                    .{
-                        .x = 0,
-                        .y = 0,
-                        .width = @intCast(term.width * term.cell_width),
-                        .height = @intCast(term.height * term.cell_height),
-                    },
-                );
-            }
+            try draw(scratch_alloc.allocator(), &render, &term);
         }
+    }
+}
+
+fn draw(scratch: std.mem.Allocator, render: *Render, term: *Term) !void {
+    if (try render.startDraw()) |image| {
+        defer render.endDraw(image) catch {};
+        try render.fill(image, @bitCast(background));
+        try term.draw(scratch, font);
+        try render.drawImage(
+            image,
+            term.image,
+            .{},
+            .{
+                .x = 0,
+                .y = 0,
+                .width = @intCast(term.width * term.cell_width),
+                .height = @intCast(term.height * term.cell_height),
+            },
+        );
     }
 }
 
