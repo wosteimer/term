@@ -3,7 +3,6 @@ const Event = @import("platform/root.zig").Event;
 const Platform = @import("platform/root.zig").Platform;
 const Term = @import("Term.zig");
 const Ansi = @import("Ansi.zig");
-const unicode = @import("unicode.zig");
 
 const c = @import("c");
 

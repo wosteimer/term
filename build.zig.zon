@@ -31,7 +31,12 @@
     // `zig build --fetch` can be used to fetch all dependencies of a package, recursively.
     // Once all dependencies are fetched, `zig build` no longer requires
     // internet connectivity.
-    .dependencies = .{},
+    .dependencies = .{
+        .zg = .{
+            .url = "https://codeberg.org/atman/zg/archive/v0.18.0.tar.gz",
+            .hash = "zg-0.18.0-oGqU3MjboAJAkIdf1n_G20BmpEZs_f30RMCacLPVlTXU",
+        },
+    },
     .paths = .{
         "build.zig",
         "build.zig.zon",

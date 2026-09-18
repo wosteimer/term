@@ -41,7 +41,6 @@ pub fn build(b: *std.Build) !void {
     c_translate.linkSystemLibrary("harfbuzz", .{});
     c_translate.linkSystemLibrary("freetype2", .{});
     c_translate.addIncludePath(b.path("deps/stb_rect_pack/"));
-    c_translate.addIncludePath(b.path("deps/utf8proc"));
     switch (backend) {
         .wayland => {
             c_translate.defineCMacro("LINUX_PLATFORM_WAYLAND", null);
@@ -62,7 +61,6 @@ pub fn build(b: *std.Build) !void {
     const c = c_translate.createModule();
     c.addIncludePath(b.path("deps/stb_rect_pack/"));
     c.addCSourceFile(.{ .file = b.path("deps/stb_rect_pack/stb_rect_pack.c") });
-    c.addCSourceFile(.{ .file = b.path("deps/utf8proc/utf8proc.c") });
     switch (backend) {
         .wayland => {
             for (protocols.items) |protocol| {
@@ -72,23 +70,7 @@ pub fn build(b: *std.Build) !void {
         .x11 => {},
     }
 
-    const generator = b.addExecutable(.{
-        .name = "generator",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("tools/generate-emoji-sequences.zig"),
-            .target = b.graph.host,
-        }),
-    });
-    const generator_run = b.addRunArtifact(generator);
-    const generator_output = generator_run.addOutputFileArg("emoji.zig");
-    generator_run.addFileArg(b.path("emoji/emoji-sequences.txt"));
-    generator_run.addFileArg(b.path("emoji/emoji-zwj-sequences.txt"));
-
-    const emoji = b.addModule("emoji", .{
-        .root_source_file = generator_output,
-        .target = target,
-        .optimize = optimize,
-    });
+    const zg = b.dependency("zg", .{});
 
     const term = b.addModule("term", .{
         .root_source_file = b.path("src/root.zig"),
@@ -96,7 +78,9 @@ pub fn build(b: *std.Build) !void {
         .optimize = optimize,
         .imports = &.{
             .{ .name = "c", .module = c },
-            .{ .name = "emoji", .module = emoji },
+            .{ .name = "Graphemes", .module = zg.module("Graphemes") },
+            .{ .name = "Emoji", .module = zg.module("Emoji") },
+            .{ .name = "code_point", .module = zg.module("code_point") },
         },
     });
     term.addOptions("options", options);

@@ -19,7 +19,6 @@
 #include <pixman-1/pixman.h>
 #include <stb_rect_pack.h>
 #include <stdbool.h>
-#include <utf8proc.h>
 
 #include <pty.h>
 #include <utmp.h>

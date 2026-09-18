@@ -1,7 +1,7 @@
 const std = @import("std");
 const Term = @import("Term.zig");
 const Platform = @import("platform/root.zig").Platform;
-const unicode = @import("unicode.zig");
+const Graphemes = @import("Graphemes");
 
 pub const Ansi = @This();
 
@@ -145,17 +145,16 @@ pub fn parse(self: *Ansi) !usize {
 }
 
 fn parseText(self: *Ansi, text: []const u8) usize {
-    var iter: unicode.GraphemeIter = undefined;
-    iter.init(text);
-    var grapheme_opt: ?unicode.GraphemeIter.Grapheme = null;
+    var iter = Graphemes.iterator(text);
+    var grapheme_opt: ?Graphemes.Grapheme = null;
     var len: usize = 0;
     while (true) {
         if (grapheme_opt) |grapheme| {
-            const bytes, const codepoints = .{ grapheme.bytes, grapheme.codepoints };
+            const bytes = grapheme.bytes(text);
             len += bytes.len;
-            self.term.insert(bytes, unicode.charWidth(codepoints)) catch unreachable;
+            self.term.insert(bytes, @intCast(grapheme.displayWidth(text))) catch unreachable;
         }
-        grapheme_opt = iter.next() catch return text.len - len - 1;
+        grapheme_opt = iter.next();
         if (grapheme_opt == null) break;
     }
     return 0;

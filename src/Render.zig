@@ -1,9 +1,11 @@
 const std = @import("std");
 const Platform = @import("platform/root.zig").Platform;
 const c = @import("c");
-const unicode = @import("unicode.zig");
 const Pool = @import("core/pool.zig").Pool;
 const Handler = @import("core/pool.zig").Handler;
+const Graphemes = @import("Graphemes");
+const Emoji = @import("Emoji");
+const code_point = @import("code_point");
 
 const Self = @This();
 const Render = @This();
@@ -351,29 +353,29 @@ const InternalImage = struct {
         var font = main_font;
         var next_font_key = font;
 
-        var iter: unicode.GraphemeIter = undefined;
-        iter.init(info.text);
+        var iter = Graphemes.iterator(info.text);
         var finish_run: bool = false;
         var fallback: bool = false;
         var start: usize = 0;
         var end: usize = 0;
 
-        while (try iter.next()) |current| {
-            const bytes, const codepoints = .{ current.bytes, current.codepoints };
-            if (unicode.isEmoji(codepoints)) {
+        while (iter.next()) |current| {
+            const bytes = current.bytes(info.text);
+            const codepoint = code_point.decodeAtIndex(bytes, 0).?.code;
+            if (Emoji.isEmojiPresentation(codepoint)) {
                 fallback = true;
                 finish_run = true;
                 const emoji_font = try cache.getFont(emoji_font_key);
                 next_font_key = emoji_font;
-            } else if (fallback and c.FT_Get_Char_Index(main_font.ft_face, codepoints[0]) != 0) {
+            } else if (fallback and c.FT_Get_Char_Index(main_font.ft_face, codepoint) != 0) {
                 fallback = false;
                 finish_run = true;
                 next_font_key = main_font;
-            } else if (c.FT_Get_Char_Index(font.ft_face, codepoints[0]) == 0) {
+            } else if (c.FT_Get_Char_Index(font.ft_face, codepoint) == 0) {
                 fallback = true;
                 finish_run = true;
                 var next_key = main_font_key;
-                next_key.codepoint = codepoints[0];
+                next_key.codepoint = codepoint;
                 next_font_key = try cache.getFont(next_key);
             }
 

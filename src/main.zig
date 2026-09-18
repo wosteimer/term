@@ -4,7 +4,6 @@ const Event = @import("term").platform.Event;
 const Modifiers = @import("term").platform.Modifiers;
 const Render = @import("term").Render;
 const Rect = @import("term").Render.Rect;
-const unicode = @import("term").unicode;
 const DateTime = @import("term").core.DateTime;
 const Term = @import("term").Term;
 const Tty = @import("term").Tty;

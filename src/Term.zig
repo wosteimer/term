@@ -1,7 +1,6 @@
 const std = @import("std");
 
 const AllocQueue = @import("core/queue.zig").AllocQueue;
-const unicode = @import("unicode.zig");
 const Render = @import("Render.zig");
 const ARGB = @import("Render.zig").ARGB;
 
