@@ -6,21 +6,18 @@ const Handler = @import("core/pool.zig").Handler;
 const Graphemes = @import("Graphemes");
 const Emoji = @import("Emoji");
 const code_point = @import("code_point");
+const ARGB = @import("colors.zig").ARGB;
 
 const Self = @This();
 const Render = @This();
 
 const log = std.log.scoped(.render);
 
-pub const ARGB = packed struct {
-    b: u8,
-    g: u8,
-    r: u8,
-    a: u8,
-
-    pub fn eq(self: ARGB, other: ARGB) bool {
-        return self.a == other.a and self.r == other.r and self.g == other.g and self.b == other.b;
-    }
+pub const Blend = enum {
+    none,
+    blend,
+    add,
+    mul,
 };
 
 pub const Rect = struct {
@@ -253,7 +250,8 @@ pub const Image = Handler;
 
 const InternalImage = struct {
     allocator: ?std.mem.Allocator = null,
-    buf: []u32,
+    buffer: ?Platform.Buffer = null,
+    pixels: []u32,
     pixman_image: ?*c.pixman_image_t,
 
     pub fn init(allocator: std.mem.Allocator, width: usize, height: usize) !InternalImage {
@@ -263,26 +261,37 @@ const InternalImage = struct {
         return self;
     }
 
-    pub fn bufInit(buf: []u32, width: usize, height: usize) InternalImage {
-        std.debug.assert(width * height <= buf.len);
+    pub fn bufInit(pixels: []u32, width: usize, height: usize) InternalImage {
+        std.debug.assert(width * height <= pixels.len);
         const stride = calcStride(@intCast(width), @bitSizeOf(u32));
         const pixman_image = c.pixman_image_create_bits(
             c.PIXMAN_a8r8g8b8,
             @intCast(width),
             @intCast(height),
-            buf.ptr,
+            pixels.ptr,
             stride,
         );
         std.debug.assert(pixman_image != null);
         return .{
-            .buf = buf,
+            .pixels = pixels,
             .pixman_image = pixman_image,
         };
     }
 
+    pub fn platformInit(platform: *Platform) ?InternalImage {
+        if (platform.getBuffer()) |buffer| {
+            const pixels = platform.getBufferPixels(buffer);
+            const size = platform.getSize();
+            var self = InternalImage.bufInit(pixels, size.width, size.height);
+            self.buffer = buffer;
+            return self;
+        }
+        return null;
+    }
+
     pub fn deinit(self: *const InternalImage) void {
         if (self.allocator) |allocator| {
-            allocator.free(self.buf);
+            allocator.free(self.pixels);
         }
         _ = c.pixman_image_unref(self.pixman_image);
     }
@@ -302,7 +311,7 @@ const InternalImage = struct {
         );
     }
 
-    pub fn drawRect(self: *const InternalImage, rect: Rect, color: ARGB) void {
+    pub fn drawRect(self: *const InternalImage, rect: Rect, color: ARGB, blend: Blend) void {
         const width: i32 = @intCast(c.pixman_image_get_width(self.pixman_image));
         const height: i32 = @intCast(c.pixman_image_get_height(self.pixman_image));
         const x1 = std.math.clamp(rect.x, 0, width);
@@ -310,7 +319,7 @@ const InternalImage = struct {
         const y1 = std.math.clamp(rect.y, 0, height);
         const y2 = std.math.clamp(rect.y + @as(i32, @intCast(rect.height)), 0, height);
         _ = c.pixman_image_fill_boxes(
-            c.PIXMAN_OP_SRC,
+            blend_to_pixman_op(blend),
             self.pixman_image,
             &argbToColor(color),
             1,
@@ -388,6 +397,7 @@ const InternalImage = struct {
                     .cursor = &cursor,
                     .color = info.color,
                     .cache = cache,
+                    .blend = info.blend,
                 });
                 start = end;
             }
@@ -406,6 +416,7 @@ const InternalImage = struct {
                 .cursor = &cursor,
                 .color = info.color,
                 .cache = cache,
+                .blend = info.blend,
             });
         }
     }
@@ -416,6 +427,7 @@ const InternalImage = struct {
         ascender: i32,
         color: ARGB = @bitCast(@as(u32, 0xFFFFFFFF)),
         cache: *FontCache,
+        blend: Blend,
     };
 
     fn drawShaper(self: *const InternalImage, info: DrawShaperInfo) !void {
@@ -429,7 +441,7 @@ const InternalImage = struct {
                 .none => {},
                 .color => {
                     c.pixman_image_composite32(
-                        c.PIXMAN_OP_OVER,
+                        blend_to_pixman_op(info.blend),
                         info.cache.atlas,
                         null,
                         dst,
@@ -447,7 +459,7 @@ const InternalImage = struct {
                     const src = c.pixman_image_create_solid_fill(&argbToColor(info.color));
                     defer _ = c.pixman_image_unref(src);
                     c.pixman_image_composite32(
-                        c.PIXMAN_OP_OVER,
+                        blend_to_pixman_op(info.blend),
                         src,
                         info.cache.atlas,
                         dst,
@@ -468,12 +480,18 @@ const InternalImage = struct {
         }
     }
 
-    pub fn drawImage(self: *const InternalImage, src_image: *const InternalImage, src_offset: Point, dst_rect: Rect) void {
+    pub fn drawImage(
+        self: *const InternalImage,
+        src_image: *const InternalImage,
+        src_offset: Point,
+        dst_rect: Rect,
+        blend: Blend,
+    ) void {
         const dst = self.pixman_image;
         const src = src_image.pixman_image;
 
         c.pixman_image_composite32(
-            c.PIXMAN_OP_OVER,
+            blend_to_pixman_op(blend),
             src,
             null,
             dst,
@@ -486,6 +504,15 @@ const InternalImage = struct {
             @intCast(dst_rect.width),
             @intCast(dst_rect.height),
         );
+    }
+
+    fn blend_to_pixman_op(blend: Blend) c.pixman_op_t {
+        return switch (blend) {
+            .none => c.PIXMAN_OP_SRC,
+            .blend => c.PIXMAN_OP_OVER,
+            .add => c.PIXMAN_OP_ADD,
+            .mul => c.PIXMAN_OP_MULTIPLY,
+        };
     }
 };
 
@@ -955,16 +982,23 @@ pub fn destroyImage(self: *Self, image: Image) !void {
 }
 
 pub fn startDraw(self: *Self) !?Image {
-    if (self.platform.getBuffer()) |buf| {
-        const size = self.platform.getSize();
-        return try self.createBufImage(buf, size.width, size.height);
-    }
-    return null;
+    const handler = try self.image_pool.create();
+    const entry = self.image_pool.getEntry(handler) catch unreachable;
+    entry.value = InternalImage.platformInit(self.platform) orelse {
+        self.image_pool.destroy(handler) catch unreachable;
+        return null;
+    };
+    return handler;
 }
 
 pub fn endDraw(self: *Self, image: Image) !void {
+    const entry = try self.image_pool.getEntry(image);
+    const internal = entry.value.?;
+    const buffer = internal.buffer orelse {
+        return error.InvalidImage;
+    };
     try self.destroyImage(image);
-    self.platform.present();
+    self.platform.present(buffer);
 }
 
 pub fn fill(self: *Self, image: Image, color: ARGB) !void {
@@ -973,10 +1007,16 @@ pub fn fill(self: *Self, image: Image, color: ARGB) !void {
     internal.fill(color);
 }
 
-pub fn drawRect(self: *Render, image: Image, rect: Rect, color: ARGB) !void {
+pub const DrawRectInfo = struct {
+    rect: Rect = .{ .x = 0, .y = 0, .width = 16, .height = 16 },
+    color: ARGB = .{ .a = 255, .r = 0, .g = 0, .b = 0 },
+    blend: Blend = .blend,
+};
+
+pub fn drawRect(self: *Render, image: Image, info: DrawRectInfo) !void {
     const entry = try self.image_pool.getEntry(image);
     const internal = entry.value.?;
-    internal.drawRect(rect, color);
+    internal.drawRect(info.rect, info.color, info.blend);
 }
 
 pub const DrawTextInfo = struct {
@@ -991,6 +1031,7 @@ pub const DrawTextInfo = struct {
     font: DrawTextInfo.Font,
     start: Point = .{},
     color: ARGB = @bitCast(@as(u32, 0xFFFFFFFF)),
+    blend: Blend = .blend,
     text: []const u8,
 };
 
@@ -1000,14 +1041,21 @@ pub fn drawText(self: *Self, image: Image, info: DrawTextInfo) !void {
     try internal.drawText(info, &self.font_cache);
 }
 
-pub fn drawImage(self: *Render, dst: Image, src: Image, src_offset: Point, dst_rect: Rect) !void {
-    const dst_entry = try self.image_pool.getEntry(dst);
-    const src_entry = try self.image_pool.getEntry(src);
+pub const DrawImageInfo = struct {
+    src: Image,
+    src_offset: Point = .{},
+    dst_rect: Rect,
+    blend: Blend = .blend,
+};
+
+pub fn drawImage(self: *Render, image: Image, info: DrawImageInfo) !void {
+    const dst_entry = try self.image_pool.getEntry(image);
+    const src_entry = try self.image_pool.getEntry(info.src);
 
     const dst_internal = dst_entry.value.?;
     const src_internal = src_entry.value.?;
 
-    dst_internal.drawImage(&src_internal, src_offset, dst_rect);
+    dst_internal.drawImage(&src_internal, info.src_offset, info.dst_rect, info.blend);
 }
 
 pub const Metrics = struct {

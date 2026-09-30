@@ -26,6 +26,7 @@ pub fn init(self: *Tty, io: std.Io, environ_map: *std.process.Environ.Map, platf
     std.debug.assert(fork != -1);
     if (fork == 0) {
         try environ_map.put("TERM", "xterm-256color");
+        try std.process.setCurrentPath(io, environ_map.get("HOME") orelse "");
         return std.process.replace(io, .{
             .argv = &.{environ_map.get("SHELL") orelse "sh"},
             .environ_map = environ_map,
@@ -83,7 +84,7 @@ pub fn readFromMaster(user_data: ?*anyopaque, event_type: Event.Fd.Type) void {
     std.log.debug("input \"{f}\"", .{std.ascii.hexEscape(self.master_buf[0..end], .lower)});
     var reader = std.Io.Reader.fixed(self.master_buf[0..end]);
     var ansi: Ansi = undefined;
-    ansi.init(&reader, self.term, self.platform);
+    ansi.init(&self.writer, &reader, self.term, self.platform);
     const rest = ansi.parse() catch unreachable;
     std.log.debug("readed {d} rest {d}", .{ readed, rest });
     @memmove(self.master_buf[0..rest], self.master_buf[end - rest .. end]);

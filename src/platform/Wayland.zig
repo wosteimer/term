@@ -147,10 +147,15 @@ const keyboard_self_len = @typeInfo(Key).@"enum".fields.len;
 const pointer_self_len = @typeInfo(Button).@"enum".fields.len;
 const text_input_buf_len = 64;
 
-const Buffer = struct {
+pub const Buffer = struct {
+    handler: u32,
+};
+
+const InternalBuffer = struct {
+    platform: *Self = undefined,
+    index: u32 = 0,
     wl_buffer: ?*c.wl_buffer = null,
     pixels: []u32 = undefined,
-    busy: bool = true,
 };
 
 wl_display: ?*c.wl_display = null,
@@ -190,8 +195,8 @@ resize_pending: bool = false,
 title: [4096:0]u8 = .{0} ** 4096,
 width: u32 = 200,
 height: u32 = 200,
-buffers: [buffers_len]Buffer = [_]Buffer{.{}} ** buffers_len,
-pending_present: ?*Buffer = null,
+buffers_queue: Queue(Buffer, buffers_len) = .empty,
+buffers: [buffers_len]InternalBuffer = [_]InternalBuffer{.{}} ** buffers_len,
 min_width: u32 = 0,
 min_height: u32 = 0,
 max_width: u32 = 0,
@@ -219,8 +224,15 @@ text_input_enabled: bool = false,
 text_input_buf: [text_input_buf_len:0]u8 = .{0} ** text_input_buf_len,
 text_input_timer_fd: std.os.linux.fd_t = -1,
 
-pub fn init(self: *Self, allocator: std.mem.Allocator) void {
+pub fn init(self: *Self, allocator: std.mem.Allocator, initial_width: u32, initial_height: u32) void {
     self.* = .{};
+
+    for (0..buffers_len) |i| {
+        self.buffers_queue.put(Buffer{ .handler = @intCast(i) }) catch unreachable;
+    }
+
+    self.width = initial_width;
+    self.height = initial_height;
     self.wl_display = c.wl_display_connect(null);
     self.wl_registry = c.wl_display_get_registry(self.wl_display);
     _ = c.wl_registry_add_listener(self.wl_registry, &wl_registry_listener, self);
@@ -360,18 +372,16 @@ fn wlCallbackDone(user_data: ?*anyopaque, wl_callback: ?*c.wl_callback, callback
     c.wl_callback_destroy(wl_callback);
 }
 
-pub fn present(self: *Self) void {
-    if (self.pending_present) |buffer| {
-        const callback = c.wl_surface_frame(self.wl_surface);
-        _ = c.wl_callback_add_listener(callback, &wl_callback_listener, self);
+pub fn present(self: *Self, buffer: Buffer) void {
+    std.debug.assert(buffer.handler < buffers_len);
+    const internal = self.buffers[buffer.handler];
 
-        c.wl_surface_attach(self.wl_surface, buffer.wl_buffer, 0, 0);
-        c.wl_surface_damage(self.wl_surface, 0, 0, std.math.maxInt(i32), std.math.maxInt(i32));
-        c.wl_surface_commit(self.wl_surface);
+    const callback = c.wl_surface_frame(self.wl_surface);
+    _ = c.wl_callback_add_listener(callback, &wl_callback_listener, self);
 
-        buffer.busy = true;
-        self.pending_present = null;
-    }
+    c.wl_surface_attach(self.wl_surface, internal.wl_buffer, 0, 0);
+    c.wl_surface_damage(self.wl_surface, 0, 0, std.math.maxInt(i32), std.math.maxInt(i32));
+    c.wl_surface_commit(self.wl_surface);
 }
 
 fn getUtf8FromKeysym(buf: [:0]u8, keysym: u32) []const u8 {
@@ -496,14 +506,14 @@ pub fn getSize(self: *Self) Size {
     return .{ .width = self.width, .height = self.height };
 }
 
-pub fn getBuffer(self: *Self) ?[]u32 {
-    for (&self.buffers) |*buffer| {
-        if (!buffer.busy) {
-            self.pending_present = buffer;
-            return buffer.pixels;
-        }
-    }
-    return null;
+pub fn getBuffer(self: *Self) ?Buffer {
+    return self.buffers_queue.take();
+}
+
+pub fn getBufferPixels(self: *Self, buffer: Buffer) []u32 {
+    std.debug.assert(buffer.handler < buffers_len);
+    const internal = self.buffers[buffer.handler];
+    return internal.pixels;
 }
 
 pub fn pumpEvents(self: *Self) void {
@@ -791,12 +801,13 @@ fn xdgSurfaceConfigure(user_data: ?*anyopaque, xdg_surface: ?*c.xdg_surface, ser
     c.xdg_surface_ack_configure(xdg_surface, serial);
     if (self.wl_shm_pool == null) {
         createBuffers(self);
-        self.buffers[0].busy = true;
+        const buffer = self.buffers_queue.take() orelse unreachable;
+        // self.buffers[0].busy = true;
 
         const callback = c.wl_surface_frame(self.wl_surface);
         _ = c.wl_callback_add_listener(callback, &wl_callback_listener, self);
 
-        c.wl_surface_attach(self.wl_surface, self.buffers[0].wl_buffer, 0, 0);
+        c.wl_surface_attach(self.wl_surface, self.buffers[buffer.handler].wl_buffer, 0, 0);
         c.wl_surface_damage(self.wl_surface, 0, 0, std.math.maxInt(i32), std.math.maxInt(i32));
         c.wl_surface_commit(self.wl_surface);
     } else if (self.resize_pending) {
@@ -850,9 +861,12 @@ fn createBuffers(self: *Self) void {
         self.wl_shm_pool_size = @intCast(size);
     }
 
+    self.buffers_queue.clear();
     for (0..buffers_len) |i| {
         cleanup(c.wl_buffer_destroy, &self.buffers[i].wl_buffer, .{});
         self.buffers[i] = .{
+            .platform = self,
+            .index = @intCast(i),
             .wl_buffer = c.wl_shm_pool_create_buffer(
                 self.wl_shm_pool,
                 stride * height * @as(i32, @intCast(i)),
@@ -862,9 +876,9 @@ fn createBuffers(self: *Self) void {
                 c.WL_SHM_FORMAT_ARGB8888,
             ),
             .pixels = self.pixels.?[@intCast(width * height * @as(i32, @intCast(i)))..],
-            .busy = false,
         };
         _ = c.wl_buffer_add_listener(self.buffers[i].wl_buffer, &wl_buffer_listener, &self.buffers[i]);
+        self.buffers_queue.put(.{ .handler = @intCast(i) }) catch unreachable;
     }
 }
 
@@ -918,8 +932,8 @@ fn xdgToplevelWmCapabilities(
 
 fn wlBufferRelease(user_data: ?*anyopaque, wl_buffer: ?*c.wl_buffer) callconv(.c) void {
     _ = wl_buffer;
-    const buffer: *Buffer = @ptrCast(@alignCast(user_data));
-    buffer.busy = false;
+    const buffer: *InternalBuffer = @ptrCast(@alignCast(user_data));
+    buffer.platform.buffers_queue.put(Buffer{ .handler = buffer.index }) catch unreachable;
 }
 
 pub fn wlKeyboardEnter(

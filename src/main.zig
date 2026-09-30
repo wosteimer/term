@@ -9,6 +9,7 @@ const Term = @import("term").Term;
 const Tty = @import("term").Tty;
 const c = @import("term").c;
 const Key = @import("term").platform.Key;
+const Pallete = @import("term").colors.Pallete;
 
 pub const std_options = std.Options{
     .logFn = logFn,
@@ -17,15 +18,6 @@ pub const std_options = std.Options{
 const log = std.log.scoped(.main);
 
 const esc = "\x1B";
-
-const background: u32 = 0xFF101010;
-const foreground: u32 = 0xFFFFFFFF;
-
-const font: Render.DrawTextInfo.Font = .{
-    .name = "JetBrains Mono",
-    .size = 16,
-    .monospace = true,
-};
 
 const Escape = struct {
     pub const Modifier = enum(u8) {
@@ -141,7 +133,7 @@ const Escape = struct {
 
 pub fn main(init: std.process.Init) !void {
     var platform: Platform = undefined;
-    platform.init(init.gpa);
+    platform.init(init.gpa, 1240, 720);
     defer platform.deinit();
 
     platform.setTitle("hello world");
@@ -151,11 +143,39 @@ pub fn main(init: std.process.Init) !void {
     var render = try Render.init(init.gpa, &platform);
     defer render.deinit();
 
-    const font_metrics = try render.getFontMetrics(.{ .name = "JetBrains Mono", .size = 16 });
+    const regular_font: Render.DrawTextInfo.Font = .{
+        .name = "JetBrains Mono",
+        .size = 16,
+        .monospace = true,
+    };
+
+    var italic_font = regular_font;
+    italic_font.italic = true;
+
+    var bold_font = regular_font;
+    bold_font.weight = .bold;
+
+    var bold_italic_font = regular_font;
+    bold_italic_font.italic = true;
+    bold_italic_font.weight = .bold;
+
+    const font_metrics = try render.getFontMetrics(.{ .name = regular_font.name, .size = regular_font.size });
     const cell_width: u32 = @intCast(font_metrics.max_advance);
     const cell_height: u32 = @intCast(font_metrics.height);
 
-    var term = try Term.init(init.gpa, &render, 80, 24, cell_width, cell_height);
+    var term = try Term.init(
+        init.gpa,
+        &render,
+        regular_font,
+        bold_font,
+        italic_font,
+        bold_italic_font,
+        Pallete.init,
+        @divFloor(1240, cell_width),
+        @divFloor(720, cell_height),
+        cell_width,
+        cell_height,
+    );
     defer term.deinit();
 
     var tty: Tty = undefined;
@@ -207,19 +227,18 @@ pub fn main(init: std.process.Init) !void {
 fn draw(scratch: std.mem.Allocator, render: *Render, term: *Term) !void {
     if (try render.startDraw()) |image| {
         defer render.endDraw(image) catch {};
-        try render.fill(image, @bitCast(background));
-        try term.draw(scratch, font);
-        try render.drawImage(
-            image,
-            term.image,
-            .{},
-            .{
+        try render.fill(image, term.pallete.default_background);
+        try term.draw(scratch);
+        try render.drawImage(image, .{
+            .src = term.image,
+            .dst_rect = .{
                 .x = 0,
                 .y = 0,
                 .width = @intCast(term.width * term.cell_width),
                 .height = @intCast(term.height * term.cell_height),
             },
-        );
+            .blend = .none,
+        });
     }
 }
 

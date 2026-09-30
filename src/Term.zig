@@ -2,7 +2,10 @@ const std = @import("std");
 
 const AllocQueue = @import("core/queue.zig").AllocQueue;
 const Render = @import("Render.zig");
-const ARGB = @import("Render.zig").ARGB;
+const ARGB = @import("colors.zig").ARGB;
+const Pallete = @import("colors.zig").Pallete;
+
+const Font = Render.DrawTextInfo.Font;
 
 const log = std.log.scoped(.term);
 
@@ -23,7 +26,7 @@ pub const Style = struct {
         color: ARGB = .{ .a = 255, .r = 255, .g = 255, .b = 255 },
         shape: Shape = .none,
 
-        pub fn eq(self: *Underline, other: *Underline) bool {
+        pub fn eq(self: Underline, other: Underline) bool {
             return self.shape == other.shape and self.color.eq(other.color);
         }
     };
@@ -43,10 +46,10 @@ pub const Style = struct {
     underline: Underline = .{},
     strikethrough: bool = false,
     background: ARGB = .{ .a = 255, .r = 0, .g = 0, .b = 0 },
-    foreground: ARGB = .{ .a = 255, .r = 255, .g = 255, .b = 255 },
+    foreground: ARGB = .{ .a = 255, .r = 192, .g = 192, .b = 192 },
 
     pub fn eq(self: Style, other: Style) bool {
-        return !(self.bold and other.bold) and
+        return self.bold == other.bold and
             self.dim == other.dim and
             self.italic == other.italic and
             self.blink == other.blink and
@@ -107,7 +110,7 @@ const Row = struct {
         allocator.free(self.cells);
     }
 
-    pub fn insert(self: *Row, index: usize, bytes: []const u8, char_width: u32) void {
+    pub fn insert(self: *Row, index: usize, bytes: []const u8, char_width: u32, style: Style) void {
         self.dirty = true;
         const start = index;
         const end = index + char_width;
@@ -116,12 +119,12 @@ const Row = struct {
         self.clearMultiCellChar(end - 1);
         for (self.cells[start..end], 0..) |*cell, i| {
             if (char_width <= 1) {
-                cell.init(bytes, .normal, .{});
+                cell.init(bytes, .normal, style);
             } else {
                 if (i == 0) {
-                    cell.init(bytes, .leading, .{});
+                    cell.init(bytes, .leading, style);
                 } else {
-                    cell.init(" ", .trailing, .{});
+                    cell.init(" ", .trailing, style);
                 }
             }
         }
@@ -231,6 +234,7 @@ render: *Render,
 image: Render.Image,
 
 style: Style = .{},
+pallete: Pallete,
 
 cursor: Cursor = .{},
 dec_cursor: Cursor = .{},
@@ -239,11 +243,21 @@ sco_cursor: Cursor = .{},
 screen: AllocQueue(Row),
 scrollback: AllocQueue(Row),
 
+regular_font: Font,
+bold_font: Font,
+italic_font: Font,
+bold_italic_font: Font,
+
 need_redraw: bool = false,
 
 pub fn init(
     allocator: std.mem.Allocator,
     render: *Render,
+    regular_font: Font,
+    bold_font: Font,
+    italic_font: Font,
+    bold_italic_font: Font,
+    pallete: Pallete,
     width: usize,
     height: usize,
     cell_width: usize,
@@ -251,6 +265,11 @@ pub fn init(
 ) !Term {
     var self = Term{
         .allocator = allocator,
+        .regular_font = regular_font,
+        .bold_font = bold_font,
+        .italic_font = italic_font,
+        .bold_italic_font = bold_italic_font,
+        .pallete = pallete,
         .render = render,
         .image = try render.createImage(cell_width * width, cell_height * height),
         .screen = try .init(allocator, height),
@@ -260,7 +279,8 @@ pub fn init(
         .cell_width = cell_width,
         .cell_height = cell_height,
     };
-    try self.render.fill(self.image, @bitCast(@as(u32, 0xFF101010)));
+    self.resetStyle();
+    try self.render.fill(self.image, self.pallete.default_background);
     while (!self.screen.isFull()) {
         self.screen.putBack(try .init(allocator, width)) catch unreachable;
     }
@@ -390,7 +410,7 @@ pub fn resize(self: *Term, width: usize, height: usize) !void {
 
     self.render.destroyImage(self.image) catch unreachable;
     self.image = try self.render.createImage(self.cell_width * width, self.cell_height * height);
-    try self.render.fill(self.image, @bitCast(@as(u32, 0xFF101010)));
+    try self.render.fill(self.image, self.pallete.default_background);
 
     var iter: RowIterator = undefined;
     iter.init(self);
@@ -436,8 +456,12 @@ pub fn resize(self: *Term, width: usize, height: usize) !void {
         }
     }
 
-    while (rows.getLastOrNull()) |row| {
-        if (row.cells.items.len != 0) break;
+    trim_end: while (rows.getLastOrNull()) |row| {
+        for (row.cells.items) |cell| {
+            if (!(std.mem.eql(u8, cell.content(), " ") or std.mem.eql(u8, cell.content(), ""))) {
+                break :trim_end;
+            }
+        }
         var removed = rows.pop().?;
         removed.cells.deinit(self.allocator);
     }
@@ -532,11 +556,38 @@ pub fn insert(self: *Term, bytes: []const u8, char_width: u32) !void {
     }
 
     const row = self.screen.getPtr(self.cursor.y).?;
-    row.insert(self.cursor.x, bytes, char_width);
+    row.insert(self.cursor.x, bytes, char_width, self.style);
 
     const x = self.cursor.x + char_width;
     const y = self.cursor.y;
     self.setCursor(x, y, x >= self.width);
+}
+
+pub const StyleInfo = struct {
+    bold: ?bool = null,
+    dim: ?bool = null,
+    italic: ?bool = null,
+    blink: ?Style.Blink = null,
+    inverse: ?bool = null,
+    hidden: ?bool = null,
+    underline: ?Style.Underline = null,
+    strikethrough: ?bool = null,
+    background: ?ARGB = null,
+    foreground: ?ARGB = null,
+};
+
+pub fn setStyle(self: *Term, style: StyleInfo) void {
+    inline for (@typeInfo(StyleInfo).@"struct".fields) |field| {
+        if (@field(style, field.name)) |value| {
+            @field(self.style, field.name) = value;
+        }
+    }
+}
+
+pub fn resetStyle(self: *Term) void {
+    self.style = .{};
+    self.style.background = self.pallete.default_background;
+    self.style.foreground = self.pallete.default_foreground;
 }
 
 pub fn scrollLeft(self: *Term, amount: usize) !void {
@@ -678,42 +729,153 @@ pub fn eraseAllLine(self: *Term) !void {
     row.eraseAll();
 }
 
-pub fn draw(self: *Term, allocator: std.mem.Allocator, font: Render.DrawTextInfo.Font) !void {
+pub fn draw(self: *Term, allocator: std.mem.Allocator) !void {
     self.need_redraw = false;
-    var allocating = std.Io.Writer.Allocating.init(allocator);
+    var accum = std.Io.Writer.Allocating.init(allocator);
     var y_offset: i32 = 0;
     var iter = self.screen.iterator();
     while (iter.next()) |row| {
         if (row.dirty) {
-            allocating.clearRetainingCapacity();
             row.dirty = false;
-            try self.render.drawRect(self.image, .{
-                .x = 0,
-                .y = y_offset,
-                .width = @intCast(self.width * self.cell_width),
-                .height = @intCast(self.cell_height),
-            }, @bitCast(@as(u32, 0xFF101010)));
-            for (row.cells[0..row.len]) |*cell| {
-                if (cell.kind != .trailing) {
-                    try allocating.writer.writeAll(cell.content());
-                }
-            }
-            const text = allocating.written();
-            if (!std.mem.eql(u8, text, "")) {
-                try self.render.drawText(self.image, .{
-                    .font = font,
-                    .text = text,
-                    .color = @bitCast(@as(u32, 0xFFFFFFFF)),
-                    .start = .{ .x = 0, .y = y_offset },
-                });
-            }
+            try self.drawRow(&accum, row, y_offset);
         }
         y_offset += @intCast(self.cell_height);
     }
+}
+
+fn drawRow(self: *Term, accum: *std.Io.Writer.Allocating, row: *Row, y: i32) !void {
     try self.render.drawRect(self.image, .{
-        .x = @intCast(self.cursor.x * self.cell_width),
-        .y = @intCast(self.cursor.y * self.cell_height),
-        .width = @intCast(self.cell_width),
-        .height = @intCast(self.cell_height),
-    }, @bitCast(@as(u32, 0xFFFFFFFF)));
+        .rect = .{
+            .x = 0,
+            .y = y,
+            .width = @intCast(self.width * self.cell_width),
+            .height = @intCast(self.cell_height),
+        },
+        .color = self.pallete.default_background,
+        .blend = .none,
+    });
+    const row_index = @divFloor(@as(usize, @intCast(y)), self.cell_height);
+    if (self.cursor.x >= row.len and self.cursor.y == row_index) {
+        try self.render.drawRect(self.image, .{
+            .rect = .{
+                .x = @intCast(self.cursor.x * self.cell_width),
+                .y = y,
+                .width = @intCast(self.cell_width),
+                .height = @intCast(self.cell_height),
+            },
+            .color = self.pallete.default_foreground,
+            .blend = .none,
+        });
+    }
+    if (row.len == 0) {
+        return;
+    }
+    accum.clearRetainingCapacity();
+    var i: usize = 0;
+    const cells = row.cells[0..row.len];
+
+    var x: i32 = 0;
+    var current_style: Style = undefined;
+    var is_cursor = false;
+    var is_end = false;
+    var state: enum { start, next, accum, draw, cursor } = .start;
+    while (i < row.len) {
+        const cell = &cells[i];
+        switch (state) {
+            .start => {
+                if (self.cursor.x == i and self.cursor.y == row_index) {
+                    is_cursor = true;
+                }
+                accum.clearRetainingCapacity();
+                try accum.writer.writeAll(cell.content());
+                x = @intCast(self.cell_width * i);
+                current_style = cell.style;
+                state = .next;
+            },
+            .next => {
+                if (i + 1 >= row.len) {
+                    is_end = true;
+                    state = if (is_cursor) .cursor else .draw;
+                } else {
+                    i += 1;
+                    state = if (is_cursor) .cursor else .accum;
+                }
+            },
+            .accum => {
+                if (cell.kind == .trailing) {
+                    state = .next;
+                } else if (!cell.style.eq(current_style)) {
+                    state = .draw;
+                } else if (self.cursor.x == i and self.cursor.y == row_index) {
+                    is_cursor = true;
+                    state = .draw;
+                } else {
+                    try accum.writer.writeAll(cell.content());
+                    state = .next;
+                }
+            },
+            .draw => {
+                if (is_end) i += 1;
+                const text = accum.written();
+                const width = (i * self.cell_width) - @as(usize, @intCast(x));
+                try self.drawText(x, y, width, text, current_style, false);
+                state = .start;
+            },
+            .cursor => {
+                if (is_end) i += 1;
+                const text = accum.written();
+                const width = (i * self.cell_width) - @as(usize, @intCast(x));
+                try self.drawText(x, y, width, text, current_style, true);
+                is_cursor = false;
+                state = .start;
+            },
+        }
+    }
+}
+
+fn drawText(self: *Term, x: i32, y: i32, width: usize, text: []const u8, style: Style, is_cursor: bool) !void {
+    var background: ARGB = style.background;
+    var foreground: ARGB = style.foreground;
+    if (style.inverse) {
+        std.mem.swap(ARGB, &background, &foreground);
+    }
+    if (is_cursor) {
+        std.mem.swap(ARGB, &background, &foreground);
+    }
+    if (style.dim) {
+        const factor = 128;
+        foreground.r = @intCast(@as(u16, @intCast(foreground.r)) * factor / 255);
+        foreground.g = @intCast(@as(u16, @intCast(foreground.g)) * factor / 255);
+        foreground.b = @intCast(@as(u16, @intCast(foreground.b)) * factor / 255);
+    }
+
+    var font: Font = undefined;
+    if (style.bold and style.italic) {
+        font = self.bold_italic_font;
+    } else if (style.italic) {
+        font = self.italic_font;
+    } else if (style.bold) {
+        font = self.bold_font;
+    } else {
+        font = self.regular_font;
+    }
+
+    try self.render.drawRect(self.image, .{
+        .rect = .{
+            .x = x,
+            .y = y,
+            .width = @intCast(width),
+            .height = @intCast(self.cell_height),
+        },
+        .color = background,
+        .blend = .none,
+    });
+    if (!std.mem.eql(u8, text, "") and !style.hidden) {
+        try self.render.drawText(self.image, .{
+            .font = font,
+            .text = text,
+            .color = foreground,
+            .start = .{ .x = x, .y = y },
+        });
+    }
 }
