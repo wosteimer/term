@@ -183,6 +183,7 @@ pub fn main(init: std.process.Init) !void {
 
     var scratch_alloc = std.heap.ArenaAllocator.init(init.gpa);
     defer scratch_alloc.deinit();
+    var frame = false;
 
     mainloop: while (true) {
         std.debug.assert(scratch_alloc.reset(.{ .retain_with_limit = 1024 * 64 }));
@@ -215,11 +216,14 @@ pub fn main(init: std.process.Init) !void {
                         else => return err,
                     }
                 },
+                .frame => frame = true,
                 else => {},
             }
         }
-        if (term.need_redraw) {
+
+        if (term.need_redraw and frame) {
             try draw(scratch_alloc.allocator(), &render, &term);
+            frame = false;
         }
     }
 }
