@@ -9,225 +9,6 @@ pub const Ansi = @This();
 
 const log = std.log.scoped(.ansi);
 
-const Arg = struct {
-    first: usize,
-    second: ?usize = null,
-};
-
-const args_capacity = 32;
-const accum_capacity = 4096;
-
-reader: *std.Io.Reader,
-platform: *Platform,
-writer: *std.Io.Writer,
-term: *Term,
-count: usize,
-accum_buf: [accum_capacity]u8 = undefined,
-accum: std.ArrayList(u8),
-
-pub fn init(self: *Ansi, writer: *std.Io.Writer, reader: *std.Io.Reader, term: *Term, platform: *Platform) void {
-    self.* = .{
-        .reader = reader,
-        .writer = writer,
-        .term = term,
-        .platform = platform,
-        .accum = .initBuffer(&self.accum_buf),
-        .count = 0,
-    };
-}
-
-pub fn parse(self: *Ansi) !usize {
-    loop: switch (try self.take()) {
-        std.ascii.control_code.esc => {
-            switch (try self.take()) {
-                '(' => {
-                    // HACK: currently just ignoring this ansi sequence
-                    self.count = 2;
-                    if (try self.take() == 0) {
-                        return self.count;
-                    }
-                    continue :loop try self.take();
-                },
-                '[' => {
-                    self.count = 2;
-                    switch (try self.peek()) {
-                        '?', '>' => {
-                            // HACK: currently just ignoring this ansi sequence
-                            _ = try self.take();
-                            var buf: [args_capacity]Arg = undefined;
-                            if (try self.parseArgs(&buf)) |_| {
-                                if (try self.take() == 0) {
-                                    return self.count;
-                                }
-                            } else {
-                                return self.count;
-                            }
-                        },
-                        '0'...'9', 'a'...'z', 'A'...'Z', '@', ';' => {
-                            var buf: [args_capacity]Arg = undefined;
-                            if (try self.parseArgs(&buf)) |args| {
-                                switch (try self.take()) {
-                                    'm' => try self.parseSGR(args),
-                                    'a'...'l', 'n'...'z', 'A'...'Z', '@' => |c| try self.parseCSI(args, c),
-                                    ' ' => {
-                                        // HACK: currently just ignoring this ansi sequence
-                                        if (try self.take() == 0) {
-                                            return self.count;
-                                        }
-                                    },
-                                    0 => return self.count,
-                                    else => |c| log.warn("unknown escape code: args: {any} code: {c}", .{ args, c }),
-                                }
-                            } else {
-                                return self.count;
-                            }
-                        },
-                        0 => return 2,
-                        else => |c| log.warn("unknown escape code: {c}", .{c}),
-                    }
-                    continue :loop try self.take();
-                },
-                ']' => {
-                    self.count = 2;
-                    if (!try self.parseOSC()) {
-                        return self.count;
-                    }
-                    continue :loop try self.take();
-                },
-                'M' => {
-                    continue :loop try self.take();
-                },
-                '7' => {
-                    self.term.decSave();
-                    continue :loop try self.take();
-                },
-                '8' => {
-                    self.term.decRestore();
-                    continue :loop try self.take();
-                },
-                0 => return 1,
-                else => {
-                    continue :loop try self.take();
-                },
-            }
-        },
-        std.ascii.control_code.lf => {
-            try self.term.lineFeed();
-            continue :loop try self.take();
-        },
-        std.ascii.control_code.cr => {
-            self.term.carriageReturn();
-            continue :loop try self.take();
-        },
-        std.ascii.control_code.bs => {
-            self.term.moveCursor(1, .left);
-            continue :loop try self.take();
-        },
-        std.ascii.control_code.del => {
-            self.term.moveCursor(1, .right);
-            continue :loop try self.take();
-        },
-        std.ascii.control_code.ht => {
-            self.term.moveCursor(8, .right);
-            continue :loop try self.take();
-        },
-        std.ascii.control_code.vt => {
-            self.term.moveCursor(1, .down);
-            continue :loop try self.take();
-        },
-        0 => {},
-        else => |first| {
-            if (std.ascii.isControl(first)) {
-                continue :loop try self.take();
-            }
-            self.accum.clearRetainingCapacity();
-            self.accum.appendBounded(first) catch {};
-            text: switch (try self.peek()) {
-                0 => {
-                    const rest = self.parseText(self.accum.items);
-                    return rest;
-                },
-                else => |c| {
-                    if (std.ascii.isControl(c)) {
-                        _ = self.parseText(self.accum.items);
-                        continue :loop try self.take();
-                    }
-                    self.accum.appendBounded(try self.take()) catch {};
-                    continue :text try self.peek();
-                },
-            }
-        },
-    }
-    return 0;
-}
-
-fn parseText(self: *Ansi, text: []const u8) usize {
-    var iter = Graphemes.iterator(text);
-    var grapheme_opt: ?Graphemes.Grapheme = null;
-    var len: usize = 0;
-    while (true) {
-        if (grapheme_opt) |grapheme| {
-            const bytes = grapheme.bytes(text);
-            len += bytes.len;
-            self.term.insert(bytes, @intCast(grapheme.displayWidth(text))) catch unreachable;
-        }
-        grapheme_opt = iter.next();
-        if (grapheme_opt == null) break;
-    }
-    return 0;
-}
-
-fn parseArgs(self: *Ansi, buf: []Arg) !?[]Arg {
-    var args = std.ArrayList(Arg).initBuffer(buf);
-    var fill_b: bool = false;
-    args: switch (try self.peek()) {
-        '0'...'9' => {
-            self.accum.clearRetainingCapacity();
-            self.accum.appendBounded(try self.take()) catch {};
-            arg: switch (try self.peek()) {
-                '0'...'9' => {
-                    self.accum.appendBounded(try self.take()) catch {};
-                    continue :arg try self.peek();
-                },
-                ';', ':' => |sep| {
-                    _ = try self.take();
-                    const arg = std.fmt.parseInt(usize, self.accum.items, 10) catch unreachable;
-                    if (fill_b) {
-                        args.items[args.items.len - 1].second = arg;
-                        fill_b = false;
-                    } else {
-                        args.appendBounded(.{ .first = arg }) catch {};
-                    }
-                    if (sep == ':') {
-                        fill_b = true;
-                    }
-                    continue :args try self.peek();
-                },
-                0 => return null,
-                else => {
-                    if (self.accum.items.len > 0) {
-                        const arg = std.fmt.parseInt(usize, self.accum.items, 10) catch unreachable;
-                        if (fill_b) {
-                            args.items[args.items.len - 1].second = arg;
-                            fill_b = false;
-                        } else {
-                            args.appendBounded(.{ .first = arg }) catch {};
-                        }
-                    }
-                },
-            }
-        },
-        ';' => {
-            _ = try self.take();
-            args.appendBounded(.{ .first = 0 }) catch {};
-            continue :args try self.peek();
-        },
-        0 => return null,
-        else => {},
-    }
-    return args.items;
-}
-
 const sgr_ops = struct {
     pub const bold = 1;
     pub const dim = 2;
@@ -256,14 +37,228 @@ const underline_shape = struct {
     pub const dashed = 5;
 };
 
-fn parseSGR(self: *Ansi, args: []Arg) !void {
-    if (args.len == 0) {
-        self.term.resetStyle();
-        return;
+const csi_ops = struct {
+    pub const scroll_left = '@';
+    pub const move_cursor_to_H = 'H';
+    pub const move_cursor_to_f = 'f';
+    pub const move_cursor_up = 'A';
+    pub const move_cursor_down = 'B';
+    pub const move_cursor_right = 'C';
+    pub const move_cursor_left = 'D';
+    pub const move_cursor_beginning_next_line = 'E';
+    pub const move_cursor_beginning_previous_line = 'F';
+    pub const move_cursor_to_column = 'G';
+    pub const delete = 'P';
+    pub const sco_save_cursor = 's';
+    pub const sco_restore_cursor = 'u';
+    pub const erase = 'J';
+    pub const erase_line = 'K';
+    pub const request_cursor_position = 'n';
+};
+
+const osc_ops = struct {
+    const set_window_title = '0';
+};
+
+const Arg = struct {
+    first: usize,
+    second: ?usize = null,
+};
+
+const ArgsIterator = struct {
+    internal_iter: SimdSplitAnyIterator(&.{ ':', ';' }),
+
+    pub fn init(input: []const u8) ArgsIterator {
+        return .{ .internal_iter = .{ .input = input } };
     }
-    var i: usize = 0;
-    while (i < args.len) : (i += 1) {
-        const arg = args[i];
+
+    pub fn next(self: *ArgsIterator) ?Arg {
+        if (self.internal_iter.next()) |split| {
+            const first = std.fmt.parseInt(usize, split.text, 10) catch 0;
+            var second: ?usize = null;
+            if (split.delimiter == ':') {
+                const next_split = self.internal_iter.next().?;
+                second = std.fmt.parseInt(usize, next_split.text, 10) catch 0;
+            }
+            return Arg{ .first = first, .second = second };
+        }
+        return null;
+    }
+};
+
+fn SimdSplitAnyIterator(comptime needles: []const u8) type {
+    return struct {
+        pub const Value = struct { text: []const u8, delimiter: u8 };
+
+        input: []const u8,
+        count: usize = 0,
+
+        pub fn next(self: *@This()) ?Value {
+            const start = self.count;
+            if (start > self.input.len) return null;
+            if (simdIndexOfAny(self.input[self.count..], needles)) |index| {
+                const end = self.count + index;
+                self.count = end + 1;
+                return .{ .text = self.input[start..end], .delimiter = self.input[end] };
+            }
+            self.count = self.input.len + 1;
+            return .{ .text = self.input[start..], .delimiter = 0 };
+        }
+    };
+}
+
+const SimdSplitControlIterator = struct {
+    pub const Value = struct { text: []const u8, control: ?u8 };
+
+    input: []const u8,
+    count: usize = 0,
+    control: ?u8 = null,
+
+    pub fn next(self: *@This()) ?Value {
+        const start = self.count;
+        if (start > self.input.len) return null;
+        if (simdIndexOfControl(self.input[self.count..])) |index| {
+            const end = self.count + index;
+            self.count = end + 1;
+            const result = Value{ .text = self.input[start..end], .control = self.control };
+            self.control = self.input[end];
+            return result;
+        }
+        self.count = self.input.len + 1;
+        return .{ .text = self.input[start..], .control = self.control };
+    }
+};
+
+platform: *Platform,
+term: *Term,
+writer: *std.Io.Writer,
+
+pub fn init(writer: *std.Io.Writer, term: *Term, platform: *Platform) Ansi {
+    return .{
+        .writer = writer,
+        .term = term,
+        .platform = platform,
+    };
+}
+
+pub fn parse(self: *Ansi, input: []const u8) !usize {
+    var iter = SimdSplitControlIterator{ .input = input };
+    var rest: usize = 0;
+
+    while (iter.next()) |current| {
+        const text = current.text;
+        var text_start: usize = 0;
+        if (current.control) |control| switch (control) {
+            std.ascii.control_code.esc => if (text.len > 0) {
+                switch (text[0]) {
+                    '(' => {
+                        // HACK: currently just ignoring this ansi sequence
+                        const offset = 1;
+                        var escape_last_char_index = simdIndexOfAnyInRange(
+                            text[offset..],
+                            0x40,
+                            0x7f,
+                        ) orelse {
+                            // INFO: incomplete escape code wait for next chunk to parse
+                            rest = text.len + 1;
+                            break;
+                        };
+                        escape_last_char_index += offset;
+                        text_start = escape_last_char_index + 1;
+                    },
+                    '[' => if (text.len >= 2) {
+                        switch (text[1]) {
+                            '<'...'?' => {
+                                // HACK: currently just ignoring this ansi sequence
+                                const offset = 2;
+                                var escape_last_char_index = simdIndexOfAnyInRange(
+                                    text[offset..],
+                                    0x40,
+                                    0x7f,
+                                ) orelse {
+                                    // INFO: incomplete escape code wait for next chunk to parse
+                                    rest = text.len + 1;
+                                    break;
+                                };
+                                escape_last_char_index += offset;
+                                text_start = escape_last_char_index + 1;
+                            },
+                            else => {
+                                const offset = 1;
+                                var escape_last_char_index = simdIndexOfAnyInRange(
+                                    text[offset..],
+                                    0x40,
+                                    0x7f,
+                                ) orelse {
+                                    // INFO: incomplete escape code wait for next chunk to parse
+                                    rest = text.len + 1;
+                                    break;
+                                };
+                                escape_last_char_index += offset;
+                                text_start = escape_last_char_index + 1;
+                                switch (text[escape_last_char_index]) {
+                                    'm' => self.parseSGR(text[offset..escape_last_char_index]),
+                                    'a'...'l', 'n'...'z', 'A'...'Z', '@' => |c| {
+                                        try self.parseCSI(text[offset..escape_last_char_index], c);
+                                    },
+                                    // ...
+                                    else => {},
+                                }
+                            },
+                        }
+                    } else {
+                        // INFO: incomplete escape code wait for next chunk to parse
+                        rest = text.len + 1;
+                        break;
+                    },
+                    ']' => {
+                        if (!self.parseOSC(text[1..])) {
+                            // INFO: incomplete escape code wait for next chunk to parse
+                            rest = text.len + 1;
+                            break;
+                        }
+                        text_start = text.len;
+                    },
+                    'M' => {
+                        // HACK: currently just ignoring this ansi sequence
+                        text_start = 1;
+                    },
+                    '7' => {
+                        self.term.decSave();
+                        text_start = 1;
+                    },
+                    '8' => {
+                        self.term.decRestore();
+                        text_start = 1;
+                    },
+                    else => {},
+                }
+            } else {
+                // INFO: incomplete escape code wait for next chunk to parse
+                rest = 1;
+                break;
+            },
+            std.ascii.control_code.bs => self.term.moveCursor(1, .left),
+            std.ascii.control_code.ht => self.term.moveCursor(8, .right),
+            std.ascii.control_code.lf => try self.term.lineFeed(),
+            std.ascii.control_code.vt => self.term.moveCursor(1, .down),
+            std.ascii.control_code.cr => self.term.carriageReturn(),
+            else => {},
+        };
+
+        if (text_start < text.len) {
+            rest = self.parseText(text[text_start..]);
+        }
+    }
+
+    return rest;
+}
+
+fn parseSGR(self: *Ansi, input: []const u8) void {
+    var iter = ArgsIterator.init(input);
+    var is_empty = true;
+    while (iter.next()) |arg| {
+        is_empty = false;
         switch (arg.first) {
             sgr_ops.bold => self.term.setStyle(.{ .bold = true }),
             sgr_ops.dim => self.term.setStyle(.{ .dim = true }),
@@ -322,91 +317,76 @@ fn parseSGR(self: *Ansi, args: []Arg) !void {
                 self.term.setStyle(.{ .background = self.term.pallete.colors_16[color] });
             },
             38 => {
-                if (i + 2 < args.len and args[i + 1].first == 5) {
-                    const code = args[i + 2].first;
-                    self.term.setStyle(.{ .foreground = Pallete.colors_256[code] });
-                    i += 2;
-                } else if (i + 4 < args.len and args[i + 1].first == 2) {
-                    self.term.setStyle(.{ .foreground = ARGB{
-                        .a = 255,
-                        .r = @intCast(args[i + 2].first),
-                        .g = @intCast(args[i + 3].first),
-                        .b = @intCast(args[i + 4].first),
-                    } });
-                    i += 4;
+                if (iter.next()) |pallete_type_arg| {
+                    if (pallete_type_arg.first == 5) {
+                        const code = if (iter.next()) |code_arg| code_arg.first else 0;
+                        self.term.setStyle(.{ .foreground = Pallete.colors_256[code] });
+                    } else if (pallete_type_arg.first == 2) {
+                        self.term.setStyle(.{ .foreground = ARGB{
+                            .a = 255,
+                            .r = @intCast(if (iter.next()) |red_arg| red_arg.first else 0),
+                            .g = @intCast(if (iter.next()) |green_arg| green_arg.first else 0),
+                            .b = @intCast(if (iter.next()) |blue_arg| blue_arg.first else 0),
+                        } });
+                    }
                 }
             },
             48 => {
-                if (i + 2 < args.len and args[i + 1].first == 5) {
-                    const code = args[i + 2].first;
-                    self.term.setStyle(.{ .background = Pallete.colors_256[code] });
-                    i += 2;
-                } else if (i + 4 < args.len and args[i + 1].first == 2) {
-                    self.term.setStyle(.{ .background = ARGB{
-                        .a = 255,
-                        .r = @intCast(args[i + 2].first),
-                        .g = @intCast(args[i + 3].first),
-                        .b = @intCast(args[i + 4].first),
-                    } });
-                    i += 4;
+                if (iter.next()) |pallete_type_arg| {
+                    if (pallete_type_arg.first == 5) {
+                        const code = if (iter.next()) |code_arg| code_arg.first else 0;
+                        self.term.setStyle(.{ .background = Pallete.colors_256[code] });
+                    } else if (pallete_type_arg.first == 2) {
+                        self.term.setStyle(.{ .background = ARGB{
+                            .a = 255,
+                            .r = @intCast(if (iter.next()) |red_arg| red_arg.first else 0),
+                            .g = @intCast(if (iter.next()) |green_arg| green_arg.first else 0),
+                            .b = @intCast(if (iter.next()) |blue_arg| blue_arg.first else 0),
+                        } });
+                    }
                 }
             },
             else => {},
         }
     }
+    if (is_empty) {
+        self.term.resetStyle();
+    }
 }
 
-const csi_ops = struct {
-    pub const scroll_left = '@';
-    pub const move_cursor_to_H = 'H';
-    pub const move_cursor_to_f = 'f';
-    pub const move_cursor_up = 'A';
-    pub const move_cursor_down = 'B';
-    pub const move_cursor_right = 'C';
-    pub const move_cursor_left = 'D';
-    pub const move_cursor_beginning_next_line = 'E';
-    pub const move_cursor_beginning_previous_line = 'F';
-    pub const move_cursor_to_column = 'G';
-    pub const delete = 'P';
-    pub const sco_save_cursor = 's';
-    pub const sco_restore_cursor = 'u';
-    pub const erase = 'J';
-    pub const erase_line = 'K';
-    pub const request_cursor_position = 'n';
-};
-
-fn parseCSI(self: *Ansi, args: []Arg, c: u8) !void {
+fn parseCSI(self: *Ansi, input: []const u8, c: u8) !void {
+    var iter = ArgsIterator.init(input);
     switch (c) {
         csi_ops.request_cursor_position => {
-            const arg = if (args.len > 0) args[0].first else 1;
-            if (arg == 6) {
+            const code = if (iter.next()) |arg| arg.first else return;
+            if (code == 6) {
                 try self.writer.print("\x1b[{d};{d}R", .{ self.term.cursor.y + 1, self.term.cursor.x + 1 });
                 try self.writer.flush();
             }
         },
         csi_ops.scroll_left => {
-            const arg = if (args.len > 0) args[0].first else 1;
-            try self.term.scrollLeft(arg);
+            const amount = if (iter.next()) |arg| @max(arg.first, 1) else 1;
+            try self.term.scrollLeft(amount);
         },
         csi_ops.move_cursor_to_H, csi_ops.move_cursor_to_f => {
-            const y = if (args.len > 0) args[0].first -| 1 else 0;
-            const x = if (args.len > 1) args[1].first -| 1 else 0;
+            const y = if (iter.next()) |arg| arg.first -| 1 else 0;
+            const x = if (iter.next()) |arg| arg.first -| 1 else 0;
             self.term.setCursor(x, y, false);
         },
         csi_ops.move_cursor_up => {
-            const amount = if (args.len > 0) args[0].first else 1;
+            const amount = if (iter.next()) |arg| @max(arg.first, 1) else 1;
             self.term.moveCursor(amount, .up);
         },
         csi_ops.move_cursor_down => {
-            const amount = if (args.len > 0) args[0].first else 1;
+            const amount = if (iter.next()) |arg| @max(arg.first, 1) else 1;
             self.term.moveCursor(amount, .down);
         },
         csi_ops.move_cursor_right => {
-            const amount = if (args.len > 0) args[0].first else 1;
+            const amount = if (iter.next()) |arg| @max(arg.first, 1) else 1;
             self.term.moveCursor(amount, .right);
         },
         csi_ops.move_cursor_left => {
-            const amount = if (args.len > 0) args[0].first else 1;
+            const amount = if (iter.next()) |arg| @max(arg.first, 1) else 1;
             self.term.moveCursor(amount, .left);
         },
         csi_ops.move_cursor_beginning_next_line => {
@@ -416,17 +396,17 @@ fn parseCSI(self: *Ansi, args: []Arg, c: u8) !void {
             self.term.moveCursorBeginningPreviousLine();
         },
         csi_ops.move_cursor_to_column => {
-            const col = if (args.len > 0) args[0].first -| 1 else 0;
+            const col = if (iter.next()) |arg| arg.first -| 1 else 0;
             self.term.moveCursorToColumn(col);
         },
         csi_ops.delete => {
-            const arg = if (args.len > 0) args[0].first else 1;
+            const arg = if (iter.next()) |arg| @max(arg.first, 1) else 1;
             try self.term.delete(arg);
         },
         csi_ops.sco_save_cursor => self.term.scoSave(),
         csi_ops.sco_restore_cursor => self.term.scoRestore(),
         csi_ops.erase => {
-            const arg = if (args.len > 0) args[0].first else 0;
+            const arg = if (iter.next()) |arg| arg.first else 0;
             switch (arg) {
                 0 => try self.term.eraseEndScreen(),
                 1 => try self.term.eraseBeginScreen(),
@@ -436,7 +416,7 @@ fn parseCSI(self: *Ansi, args: []Arg, c: u8) !void {
             }
         },
         csi_ops.erase_line => {
-            const arg = if (args.len > 0) args[0].first else 0;
+            const arg = if (iter.next()) |arg| arg.first else 0;
             switch (arg) {
                 0 => try self.term.eraseEndLine(),
                 1 => try self.term.eraseBeginLine(),
@@ -448,47 +428,101 @@ fn parseCSI(self: *Ansi, args: []Arg, c: u8) !void {
     }
 }
 
-const osc_ops = struct {
-    const set_window_title = '0';
-};
-
-pub fn parseOSC(self: *Ansi) !bool {
-    switch (try self.take()) {
-        osc_ops.set_window_title => {
-            switch (try self.take()) {
-                ';' => {
-                    self.accum.clearRetainingCapacity();
-                    title: switch (try self.take()) {
-                        std.ascii.control_code.bel => {
-                            self.platform.setTitle(self.accum.items);
-                        },
-                        0 => return false,
-                        else => |c| {
-                            self.accum.appendBounded(c) catch {};
-                            continue :title try self.take();
-                        },
-                    }
-                },
-                else => {},
-            }
-        },
-        else => {},
+pub fn parseOSC(self: *Ansi, input: []const u8) bool {
+    if (input.len < 3) return false;
+    if (std.mem.startsWith(u8, input, "0;")) {
+        self.platform.setTitle(input[2..]);
+        return true;
     }
-    return true;
+    return false;
 }
 
-fn take(self: *Ansi) !u8 {
-    const result = self.reader.takeByte() catch |err| switch (err) {
-        error.EndOfStream => return 0,
-        else => return err,
-    };
-    self.count += 1;
-    return result;
+fn parseText(self: *Ansi, text: []const u8) usize {
+    var iter = Graphemes.iterator(text);
+    var cursor: usize = 0;
+    while (iter.next()) |grapheme| {
+        const bytes = grapheme.bytes(text);
+        if (!std.unicode.utf8ValidateSlice(bytes)) {
+            return text.len - cursor;
+        }
+        self.term.insert(bytes, @intCast(grapheme.displayWidth(text))) catch unreachable;
+        cursor += bytes.len;
+    }
+    return 0;
 }
 
-fn peek(self: *Ansi) !u8 {
-    return self.reader.peekByte() catch |err| switch (err) {
-        error.EndOfStream => 0,
-        else => err,
-    };
+fn simdIndexOfAnyInRange(haystack: []const u8, start: u8, end: u8) ?usize {
+    var count: usize = 0;
+    if (std.simd.suggestVectorLength(u8)) |block_len| {
+        const Block = @Vector(block_len, u8);
+        const Mask = @Vector(block_len, bool);
+        while (count + block_len <= haystack.len) : (count += block_len) {
+            const block: Block = haystack[count..][0..block_len].*;
+            var mask: Mask = block >= @as(Block, @splat(start));
+            mask &= block < @as(Block, @splat(end));
+            if (std.simd.firstTrue(mask)) |index| {
+                return count + index;
+            }
+        }
+    }
+    if (count < haystack.len) {
+        for (haystack[count..], count..) |v, index| {
+            if (v >= start and v < end) {
+                return index;
+            }
+        }
+    }
+    return null;
+}
+
+fn simdIndexOfAny(haystack: []const u8, comptime needles: []const u8) ?usize {
+    var count: usize = 0;
+    if (std.simd.suggestVectorLength(u8)) |block_len| {
+        const Block = @Vector(block_len, u8);
+        const Mask = @Vector(block_len, bool);
+        while (count + block_len <= haystack.len) : (count += block_len) {
+            const block: Block = haystack[count..][0..block_len].*;
+            var mask: Mask = @splat(false);
+            inline for (needles) |needle| {
+                mask |= block == @as(Block, @splat(needle));
+            }
+            if (std.simd.firstTrue(mask)) |index| {
+                return count + index;
+            }
+        }
+    }
+    if (count < haystack.len) {
+        for (haystack[count..], count..) |v, index| {
+            inline for (needles) |needle| {
+                if (v == needle) {
+                    return index;
+                }
+            }
+        }
+    }
+    return null;
+}
+
+fn simdIndexOfControl(haystack: []const u8) ?usize {
+    var count: usize = 0;
+    if (std.simd.suggestVectorLength(u8)) |block_len| {
+        const Block = @Vector(block_len, u8);
+        const Mask = @Vector(block_len, bool);
+        while (count + block_len <= haystack.len) : (count += block_len) {
+            const block: Block = haystack[count..][0..block_len].*;
+            var mask: Mask = block <= @as(Block, @splat(std.ascii.control_code.us));
+            mask |= block == @as(Block, @splat(std.ascii.control_code.del));
+            if (std.simd.firstTrue(mask)) |index| {
+                return count + index;
+            }
+        }
+    }
+    if (count < haystack.len) {
+        for (haystack[count..], count..) |v, index| {
+            if (std.ascii.isControl(v)) {
+                return index;
+            }
+        }
+    }
+    return null;
 }

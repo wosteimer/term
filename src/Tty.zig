@@ -82,10 +82,8 @@ pub fn readFromMaster(user_data: ?*anyopaque, event_type: Event.Fd.Type) void {
 
     const end = readed + self.master_end;
     std.log.debug("input \"{f}\"", .{std.ascii.hexEscape(self.master_buf[0..end], .lower)});
-    var reader = std.Io.Reader.fixed(self.master_buf[0..end]);
-    var ansi: Ansi = undefined;
-    ansi.init(&self.writer, &reader, self.term, self.platform);
-    const rest = ansi.parse() catch unreachable;
+    var ansi = Ansi.init(&self.writer, self.term, self.platform);
+    const rest = ansi.parse(self.master_buf[0..end]) catch unreachable;
     std.log.debug("readed {d} rest {d}", .{ readed, rest });
     @memmove(self.master_buf[0..rest], self.master_buf[end - rest .. end]);
     self.master_end = rest;
