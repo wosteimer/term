@@ -145,6 +145,7 @@ pub fn main(init: std.process.Init) !void {
 
     const regular_font: Render.DrawTextInfo.Font = .{
         .name = "JetBrains Mono",
+        .weight = .light,
         .size = 16,
         .monospace = true,
     };

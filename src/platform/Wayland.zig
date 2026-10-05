@@ -575,15 +575,6 @@ pub fn pumpEvents(self: *Self) void {
     }
 
     if (wayland_readable) {
-        // var t_spec: std.os.linux.timespec = undefined;
-        // const err = std.os.linux.errno(std.os.linux.clock_gettime(self.clk_id, &t_spec));
-        // std.debug.assert(err == .SUCCESS);
-        // const nsecs = std.time.ns_per_s * t_spec.sec + t_spec.nsec;
-        // if (nsecs >= self.next_refresh) {
-        //     self.events.put(.{ .frame = {} }) catch {
-        //         log.warn("Event queue full, a frame discarted event missed", .{});
-        //     };
-        // }
         _ = c.wl_display_read_events(self.wl_display);
         _ = c.wl_display_dispatch_pending(self.wl_display);
     } else {
@@ -802,7 +793,6 @@ fn xdgSurfaceConfigure(user_data: ?*anyopaque, xdg_surface: ?*c.xdg_surface, ser
     if (self.wl_shm_pool == null) {
         createBuffers(self);
         const buffer = self.buffers_queue.take() orelse unreachable;
-        // self.buffers[0].busy = true;
 
         const callback = c.wl_surface_frame(self.wl_surface);
         _ = c.wl_callback_add_listener(callback, &wl_callback_listener, self);

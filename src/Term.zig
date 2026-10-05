@@ -779,6 +779,7 @@ fn drawRow(self: *Term, accum: *std.Io.Writer.Allocating, row: *Row, y: i32) !vo
     var is_cursor = false;
     var is_end = false;
     var state: enum { start, next, accum, draw, cursor } = .start;
+    var width: usize = 0;
     while (i < row.len) {
         const cell = &cells[i];
         switch (state) {
@@ -788,6 +789,7 @@ fn drawRow(self: *Term, accum: *std.Io.Writer.Allocating, row: *Row, y: i32) !vo
                 }
                 accum.clearRetainingCapacity();
                 try accum.writer.writeAll(cell.content());
+                width = self.cell_width;
                 x = @intCast(self.cell_width * i);
                 current_style = cell.style;
                 state = .next;
@@ -798,11 +800,13 @@ fn drawRow(self: *Term, accum: *std.Io.Writer.Allocating, row: *Row, y: i32) !vo
                     state = if (is_cursor) .cursor else .draw;
                 } else {
                     i += 1;
-                    state = if (is_cursor) .cursor else .accum;
+                    const next_cell = cells[i];
+                    state = if (is_cursor and next_cell.kind != .trailing) .cursor else .accum;
                 }
             },
             .accum => {
                 if (cell.kind == .trailing) {
+                    width += self.cell_width;
                     state = .next;
                 } else if (!cell.style.eq(current_style)) {
                     state = .draw;
@@ -811,20 +815,23 @@ fn drawRow(self: *Term, accum: *std.Io.Writer.Allocating, row: *Row, y: i32) !vo
                     state = .draw;
                 } else {
                     try accum.writer.writeAll(cell.content());
+                    width += self.cell_width;
                     state = .next;
                 }
             },
             .draw => {
-                if (is_end) i += 1;
+                if (is_end) {
+                    i += 1;
+                }
                 const text = accum.written();
-                const width = (i * self.cell_width) - @as(usize, @intCast(x));
                 try self.drawText(x, y, width, text, current_style, false);
                 state = .start;
             },
             .cursor => {
-                if (is_end) i += 1;
+                if (is_end) {
+                    i += 1;
+                }
                 const text = accum.written();
-                const width = (i * self.cell_width) - @as(usize, @intCast(x));
                 try self.drawText(x, y, width, text, current_style, true);
                 is_cursor = false;
                 state = .start;
