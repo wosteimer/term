@@ -18,6 +18,7 @@ const sgr_ops = struct {
     pub const fast_blink = 6;
     pub const inverse = 7;
     pub const hidden = 8;
+    pub const strikethrough = 9;
 
     pub const reset_all = 0;
     pub const reset_bold_dim = 22;
@@ -26,6 +27,8 @@ const sgr_ops = struct {
     pub const reset_blink = 25;
     pub const reset_inverse = 27;
     pub const reset_hidden = 28;
+    pub const reset_strikethrough = 29;
+    pub const reset_underline_color = 59;
 };
 
 const underline_shape = struct {
@@ -165,6 +168,7 @@ pub fn parse(self: *Ansi, input: []const u8) !usize {
                         };
                         escape_last_char_index += offset;
                         text_start = escape_last_char_index + 1;
+                        log.warn("escape code ignored: ESC{s}", .{text[0..text_start]});
                     },
                     '[' => if (text.len >= 2) {
                         switch (text[1]) {
@@ -182,6 +186,7 @@ pub fn parse(self: *Ansi, input: []const u8) !usize {
                                 };
                                 escape_last_char_index += offset;
                                 text_start = escape_last_char_index + 1;
+                                log.warn("escape code ignored: ESC{s}", .{text[0..text_start]});
                             },
                             else => {
                                 const offset = 1;
@@ -204,6 +209,7 @@ pub fn parse(self: *Ansi, input: []const u8) !usize {
                                     // ...
                                     else => {},
                                 }
+                                log.debug("escape parsed: ESC{s}", .{text[0..text_start]});
                             },
                         }
                     } else {
@@ -221,6 +227,7 @@ pub fn parse(self: *Ansi, input: []const u8) !usize {
                     },
                     'M' => {
                         // HACK: currently just ignoring this ansi sequence
+                        log.warn("escape code ignored: ESC[M", .{});
                         text_start = 1;
                     },
                     '7' => {
@@ -274,7 +281,7 @@ fn parseSGR(self: *Ansi, input: []const u8) void {
                         underline_shape.curly => .curly,
                         underline_shape.dotted => .dotted,
                         underline_shape.dashed => .dashed,
-                        else => .single,
+                        else => .none,
                     },
                 } });
             },
@@ -282,6 +289,7 @@ fn parseSGR(self: *Ansi, input: []const u8) void {
             sgr_ops.fast_blink => self.term.setStyle(.{ .blink = .fast }),
             sgr_ops.inverse => self.term.setStyle(.{ .inverse = true }),
             sgr_ops.hidden => self.term.setStyle(.{ .hidden = true }),
+            sgr_ops.strikethrough => self.term.setStyle(.{ .strikethrough = true }),
             sgr_ops.reset_all => self.term.resetStyle(),
             sgr_ops.reset_bold_dim => self.term.setStyle(.{ .bold = false, .dim = false }),
             sgr_ops.reset_italic => self.term.setStyle(.{ .italic = false }),
@@ -292,6 +300,7 @@ fn parseSGR(self: *Ansi, input: []const u8) void {
             sgr_ops.reset_blink => self.term.setStyle(.{ .blink = .static }),
             sgr_ops.reset_inverse => self.term.setStyle(.{ .inverse = false }),
             sgr_ops.reset_hidden => self.term.setStyle(.{ .hidden = false }),
+            sgr_ops.reset_strikethrough => self.term.setStyle(.{ .strikethrough = false }),
             30...37, 39 => |code| {
                 const color = code - 30;
                 if (color == Pallete.default) {
@@ -346,6 +355,28 @@ fn parseSGR(self: *Ansi, input: []const u8) void {
                     }
                 }
             },
+            58 => {
+                if (iter.next()) |pallete_type_arg| {
+                    if (pallete_type_arg.first == 5) {
+                        const code = if (iter.next()) |code_arg| code_arg.first else 0;
+                        self.term.setStyle(.{ .underline = .{
+                            .shape = self.term.style.underline.shape,
+                            .color = Pallete.colors_256[code],
+                        } });
+                    } else if (pallete_type_arg.first == 2) {
+                        self.term.setStyle(.{ .underline = .{
+                            .shape = self.term.style.underline.shape,
+                            .color = ARGB{
+                                .a = 255,
+                                .r = @intCast(if (iter.next()) |red_arg| red_arg.first else 0),
+                                .g = @intCast(if (iter.next()) |green_arg| green_arg.first else 0),
+                                .b = @intCast(if (iter.next()) |blue_arg| blue_arg.first else 0),
+                            },
+                        } });
+                    }
+                }
+            },
+            sgr_ops.reset_underline_color => self.term.style.underline.color = null,
             else => {},
         }
     }
@@ -443,11 +474,13 @@ fn parseText(self: *Ansi, text: []const u8) usize {
     while (iter.next()) |grapheme| {
         const bytes = grapheme.bytes(text);
         if (!std.unicode.utf8ValidateSlice(bytes)) {
+            log.debug("fail to parse text: {s}", .{text[cursor..]});
             return text.len - cursor;
         }
         self.term.insert(bytes, @intCast(grapheme.displayWidth(text))) catch unreachable;
         cursor += bytes.len;
     }
+    log.debug("text parsed: {s}", .{text});
     return 0;
 }
 

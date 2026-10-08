@@ -15,19 +15,26 @@ const scrollback_capacity = 1024 * 8;
 
 pub const Style = struct {
     pub const Underline = struct {
-        const Shape = enum {
-            none,
+        const Shape = enum(u32) {
+            none = 0,
             single,
             double,
             curly,
             dotted,
             dashed,
         };
-        color: ARGB = .{ .a = 255, .r = 255, .g = 255, .b = 255 },
+        color: ?ARGB = null,
         shape: Shape = .none,
 
         pub fn eq(self: Underline, other: Underline) bool {
-            return self.shape == other.shape and self.color.eq(other.color);
+            if (self.color == null and other.color != null) {
+                return false;
+            } else if (self.color != null and other.color == null) {
+                return false;
+            } else if (self.color == null and other.color == null) {
+                return self.shape == other.shape;
+            }
+            return self.shape == other.shape and self.color.?.eq(other.color.?);
         }
     };
 
@@ -225,10 +232,16 @@ const Cursor = struct {
 
 allocator: std.mem.Allocator,
 
-width: usize,
-height: usize,
+pixel_width: usize,
+pixel_height: usize,
 cell_width: usize,
 cell_height: usize,
+rows: usize,
+cols: usize,
+underline_position: i32,
+underline_thickness: u32,
+underline_height: u32,
+underline_mask: Render.Image = undefined,
 
 render: *Render,
 image: Render.Image,
@@ -258,11 +271,36 @@ pub fn init(
     italic_font: Font,
     bold_italic_font: Font,
     pallete: Pallete,
-    width: usize,
-    height: usize,
-    cell_width: usize,
-    cell_height: usize,
+    pixel_width: usize,
+    pixel_height: usize,
 ) !Term {
+    const metrics = try render.getFontMetrics(
+        .{
+            .name = regular_font.name,
+            .size = regular_font.size,
+            .italic = regular_font.italic,
+            .weight = regular_font.weight,
+        },
+    );
+
+    const font_height = metrics.ascender - metrics.descender;
+    const underline_position = font_height + metrics.underline_position;
+    var underline_thickness: u32 = @max(
+        1,
+        @as(u32, @intFromFloat(@ceil(@as(f32, @floatFromInt(font_height)) * 0.025))),
+    );
+    if (metrics.underline_thickness > 0) {
+        underline_thickness = @intCast(metrics.underline_thickness);
+    }
+
+    const underline_padding = 3;
+    const underline_height = underline_padding * underline_thickness;
+    const cell_width: usize = @intCast(metrics.max_advance);
+    const cell_height: usize = @intCast(underline_position + @as(i32, @intCast(underline_height)));
+
+    const cols = @divFloor(pixel_width, cell_width);
+    const rows = @divFloor(pixel_height, cell_height);
+
     var self = Term{
         .allocator = allocator,
         .regular_font = regular_font,
@@ -271,24 +309,31 @@ pub fn init(
         .bold_italic_font = bold_italic_font,
         .pallete = pallete,
         .render = render,
-        .image = try render.createImage(cell_width * width, cell_height * height),
-        .screen = try .init(allocator, height),
+        .image = try render.createImage(pixel_width, pixel_height),
+        .screen = try .init(allocator, rows),
         .scrollback = try .init(allocator, scrollback_capacity),
-        .width = width,
-        .height = height,
+        .pixel_width = pixel_width,
+        .pixel_height = pixel_height,
         .cell_width = cell_width,
         .cell_height = cell_height,
+        .rows = rows,
+        .cols = cols,
+        .underline_position = underline_position,
+        .underline_thickness = underline_thickness,
+        .underline_height = underline_height,
     };
     self.resetStyle();
     try self.render.fill(self.image, self.pallete.default_background);
     while (!self.screen.isFull()) {
-        self.screen.putBack(try .init(allocator, width)) catch unreachable;
+        self.screen.putBack(try .init(allocator, cols)) catch unreachable;
     }
+    try self.createUnderlineMask();
     return self;
 }
 
 pub fn deinit(self: *Term) void {
     self.render.destroyImage(self.image) catch unreachable;
+    self.render.destroyImage(self.underline_mask) catch unreachable;
     var iter = self.screen.iterator();
     while (iter.next()) |row| {
         row.deinit(self.allocator);
@@ -408,8 +453,11 @@ const VirtualRow = struct {
 pub fn resize(self: *Term, width: usize, height: usize) !void {
     self.need_redraw = true;
 
+    const cols = @divFloor(width, self.cell_width);
+    const rows = @divFloor(height, self.cell_height);
+
     self.render.destroyImage(self.image) catch unreachable;
-    self.image = try self.render.createImage(self.cell_width * width, self.cell_height * height);
+    self.image = try self.render.createImage(width, height);
     try self.render.fill(self.image, self.pallete.default_background);
 
     var iter: RowIterator = undefined;
@@ -417,8 +465,8 @@ pub fn resize(self: *Term, width: usize, height: usize) !void {
 
     var virtual_row: VirtualRow = .{};
     defer virtual_row.cells.deinit(self.allocator);
-    var rows: std.ArrayList(VirtualRow) = .empty;
-    defer rows.deinit(self.allocator);
+    var virtual_rows: std.ArrayList(VirtualRow) = .empty;
+    defer virtual_rows.deinit(self.allocator);
 
     while (iter.next()) |result| {
         const old_row = result.row;
@@ -428,21 +476,21 @@ pub fn resize(self: *Term, width: usize, height: usize) !void {
         if (old_row.wrapped) {
             try virtual_row.cells.appendSlice(self.allocator, old_row.cells[0..old_row.len]);
         } else if (old_row.len == 0) {
-            try rows.append(self.allocator, .{});
+            try virtual_rows.append(self.allocator, .{});
         } else {
             try virtual_row.cells.appendSlice(self.allocator, old_row.cells[0..old_row.len]);
-            var window_iter = WindowIterator.init(virtual_row.cells.items, width);
+            var window_iter = WindowIterator.init(virtual_row.cells.items, cols);
             var window_index: usize = 0;
             while (window_iter.next()) |window| : (window_index += 1) {
                 if (window_index > 0) {
-                    rows.items[rows.items.len - 1].wrapped = true;
+                    virtual_rows.items[virtual_rows.items.len - 1].wrapped = true;
                 }
 
                 var new_row = VirtualRow{};
                 try new_row.cells.appendSlice(self.allocator, window.cells);
 
                 const window_start = window.offset;
-                const window_end = window_start + width;
+                const window_end = window_start + cols;
 
                 if (virtual_row.cursor_offset) |offset| {
                     if (offset >= window_start and offset < window_end) {
@@ -450,25 +498,25 @@ pub fn resize(self: *Term, width: usize, height: usize) !void {
                     }
                 }
 
-                try rows.append(self.allocator, new_row);
+                try virtual_rows.append(self.allocator, new_row);
             }
             virtual_row.clear();
         }
     }
 
-    trim_end: while (rows.getLastOrNull()) |row| {
+    trim_end: while (virtual_rows.getLastOrNull()) |row| {
         for (row.cells.items) |cell| {
             if (!(std.mem.eql(u8, cell.content(), " ") or std.mem.eql(u8, cell.content(), ""))) {
                 break :trim_end;
             }
         }
-        var removed = rows.pop().?;
+        var removed = virtual_rows.pop().?;
         removed.cells.deinit(self.allocator);
     }
 
-    const screen_start = rows.items.len -| height;
-    const scrollback_slice = rows.items[0..screen_start];
-    const screen_slice = rows.items[screen_start..];
+    const screen_start = virtual_rows.items.len -| rows;
+    const scrollback_slice = virtual_rows.items[0..screen_start];
+    const screen_slice = virtual_rows.items[screen_start..];
 
     var queue_iter = self.scrollback.iterator();
     while (queue_iter.next()) |row| {
@@ -488,28 +536,33 @@ pub fn resize(self: *Term, width: usize, height: usize) !void {
             const removed = self.scrollback.takeFront().?;
             removed.deinit(self.allocator);
         }
-        self.scrollback.putBack(try current_virtual_row.toRow(self.allocator, width)) catch unreachable;
+        self.scrollback.putBack(try current_virtual_row.toRow(self.allocator, cols)) catch unreachable;
         current_virtual_row.cells.deinit(self.allocator);
     }
 
-    self.screen = try .init(self.allocator, height);
+    self.screen = try .init(self.allocator, rows);
     for (screen_slice, 0..) |*current_virtual_row, y| {
         if (current_virtual_row.cursor_offset) |x| {
             self.cursor = .{
                 .x = x,
                 .y = y,
-                .wrap_pending = self.cursor.wrap_pending and x == width - 1,
+                .wrap_pending = self.cursor.wrap_pending and x == cols - 1,
             };
         }
-        self.screen.putBack(try current_virtual_row.toRow(self.allocator, width)) catch unreachable;
+        self.screen.putBack(try current_virtual_row.toRow(self.allocator, cols)) catch unreachable;
         current_virtual_row.cells.deinit(self.allocator);
     }
     while (!self.screen.isFull()) {
-        self.screen.putBack(try .init(self.allocator, width)) catch unreachable;
+        self.screen.putBack(try .init(self.allocator, cols)) catch unreachable;
     }
 
-    self.width = width;
-    self.height = height;
+    self.rows = rows;
+    self.cols = cols;
+    self.pixel_width = width;
+    self.pixel_height = height;
+
+    self.render.destroyImage(self.underline_mask) catch unreachable;
+    try self.createUnderlineMask();
 }
 
 fn scroll(self: *Term) !void {
@@ -519,7 +572,7 @@ fn scroll(self: *Term) !void {
             deleted.deinit(self.allocator);
         }
         self.scrollback.putBack(row) catch unreachable;
-        self.screen.putBack(try .init(self.allocator, self.width)) catch unreachable;
+        self.screen.putBack(try .init(self.allocator, self.cols)) catch unreachable;
         var iter = self.screen.iterator();
         while (iter.next()) |current| {
             current.dirty = true;
@@ -531,7 +584,7 @@ fn scroll(self: *Term) !void {
 pub fn lineFeed(self: *Term) !void {
     self.need_redraw = true;
     const y = self.cursor.y + 1;
-    if (y >= self.height) {
+    if (y >= self.rows) {
         try self.scroll();
     }
     self.setCursor(self.cursor.x, y, false);
@@ -544,12 +597,12 @@ pub fn carriageReturn(self: *Term) void {
 
 pub fn insert(self: *Term, bytes: []const u8, char_width: u32) !void {
     self.need_redraw = true;
-    if (self.cursor.wrap_pending or self.width - self.cursor.x < char_width) {
+    if (self.cursor.wrap_pending or self.cols - self.cursor.x < char_width) {
         if (self.screen.getPtr(self.cursor.y)) |row| {
             row.wrapped = true;
         }
         const y = self.cursor.y + 1;
-        if (y >= self.height) {
+        if (y >= self.rows) {
             try self.scroll();
         }
         self.setCursor(0, y, false);
@@ -560,7 +613,7 @@ pub fn insert(self: *Term, bytes: []const u8, char_width: u32) !void {
 
     const x = self.cursor.x + char_width;
     const y = self.cursor.y;
-    self.setCursor(x, y, x >= self.width);
+    self.setCursor(x, y, x >= self.cols);
 }
 
 pub const StyleInfo = struct {
@@ -586,6 +639,7 @@ pub fn setStyle(self: *Term, style: StyleInfo) void {
 
 pub fn resetStyle(self: *Term) void {
     self.style = .{};
+    self.style.underline.color = null;
     self.style.background = self.pallete.default_background;
     self.style.foreground = self.pallete.default_foreground;
 }
@@ -639,8 +693,8 @@ pub fn moveCursorToColumn(self: *Term, col: usize) void {
 pub fn setCursor(self: *Term, x: usize, y: usize, wrap_pending: bool) void {
     self.need_redraw = true;
     self.screen.getPtr(self.cursor.y).?.dirty = true;
-    const cx = std.math.clamp(x, 0, self.width - 1);
-    const cy = std.math.clamp(y, 0, self.height - 1);
+    const cx = std.math.clamp(x, 0, self.cols - 1);
+    const cy = std.math.clamp(y, 0, self.rows - 1);
     self.screen.getPtr(cy).?.dirty = true;
     self.cursor = .{ .x = cx, .y = cy, .wrap_pending = wrap_pending };
 }
@@ -732,29 +786,29 @@ pub fn eraseAllLine(self: *Term) !void {
 pub fn draw(self: *Term, allocator: std.mem.Allocator) !void {
     self.need_redraw = false;
     var accum = std.Io.Writer.Allocating.init(allocator);
-    var y_offset: i32 = 0;
+    var row_index: usize = 0;
     var iter = self.screen.iterator();
     while (iter.next()) |row| {
         if (row.dirty) {
             row.dirty = false;
-            try self.drawRow(&accum, row, y_offset);
+            try self.drawRow(&accum, row, row_index);
         }
-        y_offset += @intCast(self.cell_height);
+        row_index += 1;
     }
 }
 
-fn drawRow(self: *Term, accum: *std.Io.Writer.Allocating, row: *Row, y: i32) !void {
+fn drawRow(self: *Term, accum: *std.Io.Writer.Allocating, row: *Row, row_index: usize) !void {
+    const y: i32 = @intCast(row_index * (self.cell_height));
     try self.render.drawRect(self.image, .{
         .rect = .{
             .x = 0,
             .y = y,
-            .width = @intCast(self.width * self.cell_width),
+            .width = @intCast(self.pixel_width),
             .height = @intCast(self.cell_height),
         },
         .color = self.pallete.default_background,
         .blend = .none,
     });
-    const row_index = @divFloor(@as(usize, @intCast(y)), self.cell_height);
     if (self.cursor.x >= row.len and self.cursor.y == row_index) {
         try self.render.drawRect(self.image, .{
             .rect = .{
@@ -771,7 +825,7 @@ fn drawRow(self: *Term, accum: *std.Io.Writer.Allocating, row: *Row, y: i32) !vo
         return;
     }
     accum.clearRetainingCapacity();
-    var i: usize = 0;
+    var col_index: usize = 0;
     const cells = row.cells[0..row.len];
 
     var x: i32 = 0;
@@ -780,27 +834,27 @@ fn drawRow(self: *Term, accum: *std.Io.Writer.Allocating, row: *Row, y: i32) !vo
     var is_end = false;
     var state: enum { start, next, accum, draw, cursor } = .start;
     var width: usize = 0;
-    while (i < row.len) {
-        const cell = &cells[i];
+    while (col_index < row.len) {
+        const cell = &cells[col_index];
         switch (state) {
             .start => {
-                if (self.cursor.x == i and self.cursor.y == row_index) {
+                if (self.cursor.x == col_index and self.cursor.y == row_index) {
                     is_cursor = true;
                 }
                 accum.clearRetainingCapacity();
                 try accum.writer.writeAll(cell.content());
                 width = self.cell_width;
-                x = @intCast(self.cell_width * i);
+                x = @intCast(self.cell_width * col_index);
                 current_style = cell.style;
                 state = .next;
             },
             .next => {
-                if (i + 1 >= row.len) {
+                if (col_index + 1 >= row.len) {
                     is_end = true;
                     state = if (is_cursor) .cursor else .draw;
                 } else {
-                    i += 1;
-                    const next_cell = cells[i];
+                    col_index += 1;
+                    const next_cell = cells[col_index];
                     state = if (is_cursor and next_cell.kind != .trailing) .cursor else .accum;
                 }
             },
@@ -810,7 +864,7 @@ fn drawRow(self: *Term, accum: *std.Io.Writer.Allocating, row: *Row, y: i32) !vo
                     state = .next;
                 } else if (!cell.style.eq(current_style)) {
                     state = .draw;
-                } else if (self.cursor.x == i and self.cursor.y == row_index) {
+                } else if (self.cursor.x == col_index and self.cursor.y == row_index) {
                     is_cursor = true;
                     state = .draw;
                 } else {
@@ -821,7 +875,7 @@ fn drawRow(self: *Term, accum: *std.Io.Writer.Allocating, row: *Row, y: i32) !vo
             },
             .draw => {
                 if (is_end) {
-                    i += 1;
+                    col_index += 1;
                 }
                 const text = accum.written();
                 try self.drawText(x, y, width, text, current_style, false);
@@ -829,7 +883,7 @@ fn drawRow(self: *Term, accum: *std.Io.Writer.Allocating, row: *Row, y: i32) !vo
             },
             .cursor => {
                 if (is_end) {
-                    i += 1;
+                    col_index += 1;
                 }
                 const text = accum.written();
                 try self.drawText(x, y, width, text, current_style, true);
@@ -877,6 +931,43 @@ fn drawText(self: *Term, x: i32, y: i32, width: usize, text: []const u8, style: 
         .color = background,
         .blend = .none,
     });
+
+    const metrics = try self.render.getFontMetrics(
+        .{ .name = font.name, .size = font.size, .italic = font.italic, .weight = font.weight },
+    );
+
+    if (style.strikethrough) {
+        try self.render.drawRect(self.image, .{
+            .blend = .none,
+            .color = foreground,
+            .rect = .{
+                .x = x,
+                .y = y + metrics.ascender + metrics.descender,
+                .width = @intCast(width),
+                .height = self.underline_thickness,
+            },
+        });
+    }
+    switch (style.underline.shape) {
+        .none => {},
+        else => {
+            const mask_y_offset: i32 = @intCast((@intFromEnum(style.underline.shape) - 1) * self.underline_height);
+            try self.render.drawRect(self.image, .{
+                .blend = .blend,
+                .color = style.underline.color orelse foreground,
+                .mask = .{
+                    .offset = .{ .x = x, .y = mask_y_offset },
+                    .image = self.underline_mask,
+                },
+                .rect = .{
+                    .x = x,
+                    .y = y + self.underline_position,
+                    .width = @intCast(width),
+                    .height = self.underline_height,
+                },
+            });
+        },
+    }
     if (!std.mem.eql(u8, text, "") and !style.hidden) {
         try self.render.drawText(self.image, .{
             .font = font,
@@ -884,5 +975,151 @@ fn drawText(self: *Term, x: i32, y: i32, width: usize, text: []const u8, style: 
             .color = foreground,
             .start = .{ .x = x, .y = y },
         });
+    }
+}
+
+fn createUnderlineMask(self: *Term) !void {
+    const mask_height = 5 * self.underline_height;
+
+    const mask = try self.render.createImage(self.pixel_width, mask_height);
+    errdefer self.render.destroyImage(mask) catch unreachable;
+
+    try self.render.fill(mask, .{ .a = 0, .r = 0, .g = 0, .b = 0 });
+
+    var y_offset: usize = 0;
+    try self.drawLine(mask, 0, y_offset, self.pixel_width);
+    y_offset += self.underline_height;
+    try self.drawDoubleLine(mask, 0, y_offset, self.pixel_width);
+    y_offset += self.underline_height;
+    try self.drawCurlyLine(mask, 0, y_offset, self.pixel_width);
+    y_offset += self.underline_height;
+    try self.drawDashedLine(mask, 0, y_offset, self.pixel_width, 1, 1);
+    y_offset += self.underline_height;
+    try self.drawDashedLine(mask, 0, y_offset, self.pixel_width, 6, 4);
+
+    self.underline_mask = mask;
+}
+
+fn drawLine(self: *Term, image: Render.Image, offset_x: usize, offset_y: usize, width: usize) !void {
+    try self.render.drawRect(image, .{
+        .blend = .none,
+        .color = .{ .a = 255, .r = 255, .g = 255, .b = 255 },
+        .rect = .{
+            .x = @intCast(offset_x),
+            .y = @intCast(offset_y),
+            .width = @intCast(width),
+            .height = self.underline_thickness,
+        },
+    });
+}
+
+fn drawDoubleLine(self: *Term, image: Render.Image, offset_x: usize, offset_y: usize, width: usize) !void {
+    try self.render.drawRect(image, .{
+        .blend = .none,
+        .color = .{ .a = 255, .r = 255, .g = 255, .b = 255 },
+        .rect = .{
+            .x = @intCast(offset_x),
+            .y = @intCast(offset_y),
+            .width = @intCast(width),
+            .height = self.underline_thickness,
+        },
+    });
+    try self.render.drawRect(image, .{
+        .blend = .none,
+        .color = .{ .a = 255, .r = 255, .g = 255, .b = 255 },
+        .rect = .{
+            .x = @intCast(offset_x),
+            .y = @intCast(offset_y + 2 * self.underline_thickness),
+            .width = @intCast(width),
+            .height = self.underline_thickness,
+        },
+    });
+}
+
+fn drawCurlyLine(self: *Term, image: Render.Image, offset_x: usize, offset_y: usize, width: usize) !void {
+    const pixels = try self.render.getPixels(image);
+
+    const thickness: f32 = @floatFromInt(self.underline_thickness);
+
+    const amplitude = @max(1.0, thickness * 0.75);
+    const period: f32 = @as(f32, @floatFromInt(self.cell_width)) * 0.8;
+    const center: f32 = @as(f32, @floatFromInt(self.underline_height)) * 0.5;
+
+    const two_pi: f32 = 2.0 * std.math.pi;
+    const samples = 8;
+
+    for (offset_y..self.underline_height + offset_y) |y| {
+        for (offset_x..width + offset_x) |x| {
+            var covered: u32 = 0;
+
+            for (0..samples) |sy| {
+                for (0..samples) |sx| {
+                    const px =
+                        @as(f32, @floatFromInt(x)) +
+                        (@as(f32, @floatFromInt(sx)) + 0.5) / samples;
+
+                    const py =
+                        @as(f32, @floatFromInt(y)) +
+                        (@as(f32, @floatFromInt(sy)) + 0.5) / samples;
+
+                    const curve_y =
+                        (@as(f32, @floatFromInt(offset_y)) + center) +
+                        amplitude * @sin(px * two_pi / period);
+
+                    if (@abs(py - curve_y) <= thickness * 0.5) {
+                        covered += 1;
+                    }
+                }
+            }
+
+            const alpha_dividend: f32 = 255.0 * @as(f32, @floatFromInt(covered));
+            const alpha_divisor: f32 = @floatFromInt(samples * samples);
+            const alpha: u8 = @intFromFloat(alpha_dividend / alpha_divisor);
+            const inv_alpha = 255 - alpha;
+
+            pixels[y * (width + offset_x) + x] = @bitCast(ARGB{
+                .a = @intCast(alpha),
+                .r = 255 - inv_alpha,
+                .g = 255 - inv_alpha,
+                .b = 255 - inv_alpha,
+            });
+        }
+    }
+}
+
+fn drawDashedLine(
+    self: *Term,
+    image: Render.Image,
+    offset_x: usize,
+    offset_y: usize,
+    width: usize,
+    line_len: usize,
+    gap_len: usize,
+) !void {
+    const image_pixels = try self.render.getPixels(image);
+    for (offset_y..self.underline_thickness + offset_y) |y| {
+        var state: enum { line, gap } = .line;
+        var count: usize = 0;
+        for (offset_x..width + offset_x) |x| {
+            const pixel = &image_pixels[y * (width + offset_x) + x];
+            switch (state) {
+                .line => {
+                    pixel.* = 0xffffffff;
+                    if (count >= line_len * self.underline_thickness) {
+                        count = 0;
+                        state = .gap;
+                        continue;
+                    }
+                },
+                .gap => {
+                    if (count >= gap_len * self.underline_thickness) {
+                        count = 0;
+                        state = .line;
+                        continue;
+                    }
+                },
+            }
+            count += 1;
+        }
     }
 }

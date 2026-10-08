@@ -311,24 +311,30 @@ const InternalImage = struct {
         );
     }
 
-    pub fn drawRect(self: *const InternalImage, rect: Rect, color: ARGB, blend: Blend) void {
-        const width: i32 = @intCast(c.pixman_image_get_width(self.pixman_image));
-        const height: i32 = @intCast(c.pixman_image_get_height(self.pixman_image));
-        const x1 = std.math.clamp(rect.x, 0, width);
-        const x2 = std.math.clamp(rect.x + @as(i32, @intCast(rect.width)), 0, width);
-        const y1 = std.math.clamp(rect.y, 0, height);
-        const y2 = std.math.clamp(rect.y + @as(i32, @intCast(rect.height)), 0, height);
-        _ = c.pixman_image_fill_boxes(
-            blend_to_pixman_op(blend),
+    pub fn drawRect(self: *const InternalImage, pool: *Pool(InternalImage), info: DrawRectInfo) !void {
+        const src_pixman_image = c.pixman_image_create_solid_fill(&argbToColor(info.color));
+        defer _ = c.pixman_image_unref(src_pixman_image);
+
+        var mask_pixman_image: ?*c.pixman_image_t = null;
+        if (info.mask) |mask_info| {
+            const mask_entry = try pool.getEntry(mask_info.image);
+            const mask_image = mask_entry.value.?;
+            mask_pixman_image = mask_image.pixman_image;
+        }
+
+        c.pixman_image_composite32(
+            blend_to_pixman_op(info.blend),
+            src_pixman_image,
+            mask_pixman_image,
             self.pixman_image,
-            &argbToColor(color),
-            1,
-            &c.pixman_box32{
-                .x1 = x1,
-                .y1 = y1,
-                .x2 = x2,
-                .y2 = y2,
-            },
+            0,
+            0,
+            if (info.mask) |mask_info| mask_info.offset.x else 0,
+            if (info.mask) |mask_info| mask_info.offset.y else 0,
+            info.rect.x,
+            info.rect.y,
+            @intCast(info.rect.width),
+            @intCast(info.rect.height),
         );
     }
 
@@ -480,29 +486,30 @@ const InternalImage = struct {
         }
     }
 
-    pub fn drawImage(
-        self: *const InternalImage,
-        src_image: *const InternalImage,
-        src_offset: Point,
-        dst_rect: Rect,
-        blend: Blend,
-    ) void {
-        const dst = self.pixman_image;
-        const src = src_image.pixman_image;
+    pub fn drawImage(self: *const InternalImage, pool: *Pool(InternalImage), info: DrawImageInfo) !void {
+        const src_entry = try pool.getEntry(info.src.image);
+        const src_image = src_entry.value.?;
+
+        var mask_pixman_image: ?*c.pixman_image_t = null;
+        if (info.mask) |mask_info| {
+            const mask_entry = try pool.getEntry(mask_info.image);
+            const mask_image = mask_entry.value.?;
+            mask_pixman_image = mask_image.pixman_image;
+        }
 
         c.pixman_image_composite32(
-            blend_to_pixman_op(blend),
-            src,
-            null,
-            dst,
-            @intCast(src_offset.x),
-            @intCast(src_offset.y),
-            0,
-            0,
-            @intCast(dst_rect.x),
-            @intCast(dst_rect.y),
-            @intCast(dst_rect.width),
-            @intCast(dst_rect.height),
+            blend_to_pixman_op(info.blend),
+            src_image.pixman_image,
+            mask_pixman_image,
+            self.pixman_image,
+            info.src.offset.x,
+            info.src.offset.y,
+            if (info.mask) |mask_info| mask_info.offset.x else 0,
+            if (info.mask) |mask_info| mask_info.offset.y else 0,
+            info.rect.x,
+            info.rect.y,
+            @intCast(info.rect.width),
+            @intCast(info.rect.height),
         );
     }
 
@@ -1007,16 +1014,22 @@ pub fn fill(self: *Self, image: Image, color: ARGB) !void {
     internal.fill(color);
 }
 
+pub const MaskInfo = struct {
+    image: Image,
+    offset: Point = .{},
+};
+
 pub const DrawRectInfo = struct {
     rect: Rect = .{ .x = 0, .y = 0, .width = 16, .height = 16 },
     color: ARGB = .{ .a = 255, .r = 0, .g = 0, .b = 0 },
+    mask: ?MaskInfo = null,
     blend: Blend = .blend,
 };
 
 pub fn drawRect(self: *Render, image: Image, info: DrawRectInfo) !void {
     const entry = try self.image_pool.getEntry(image);
     const internal = entry.value.?;
-    internal.drawRect(info.rect, info.color, info.blend);
+    try internal.drawRect(&self.image_pool, info);
 }
 
 pub const DrawTextInfo = struct {
@@ -1042,20 +1055,29 @@ pub fn drawText(self: *Self, image: Image, info: DrawTextInfo) !void {
 }
 
 pub const DrawImageInfo = struct {
-    src: Image,
-    src_offset: Point = .{},
-    dst_rect: Rect,
+    pub const SrcInfo = struct {
+        image: Image,
+        offset: Point = .{},
+    };
+
+    src: SrcInfo,
+    rect: Rect,
+    mask: ?MaskInfo = null,
     blend: Blend = .blend,
 };
 
 pub fn drawImage(self: *Render, image: Image, info: DrawImageInfo) !void {
     const dst_entry = try self.image_pool.getEntry(image);
-    const src_entry = try self.image_pool.getEntry(info.src);
-
     const dst_internal = dst_entry.value.?;
-    const src_internal = src_entry.value.?;
 
-    dst_internal.drawImage(&src_internal, info.src_offset, info.dst_rect, info.blend);
+    try dst_internal.drawImage(&self.image_pool, info);
+}
+
+pub fn getPixels(self: *Render, image: Image) ![]u32 {
+    const dst_entry = try self.image_pool.getEntry(image);
+    const dst_internal = dst_entry.value.?;
+
+    return dst_internal.pixels;
 }
 
 pub const Metrics = struct {
@@ -1063,6 +1085,8 @@ pub const Metrics = struct {
     max_advance: i32,
     ascender: i32,
     descender: i32,
+    underline_position: i32,
+    underline_thickness: i32,
 };
 
 pub const GetFontMetricsInfo = struct {
@@ -1076,7 +1100,7 @@ pub fn getFontMetrics(self: *Render, info: GetFontMetricsInfo) !Metrics {
     const key = FontKey{
         .name = info.name,
         .size = info.size,
-        .codepoint = 0,
+        .codepoint = null,
         .weight = info.weight,
         .italic = info.italic,
     };
@@ -1086,6 +1110,8 @@ pub fn getFontMetrics(self: *Render, info: GetFontMetricsInfo) !Metrics {
         .max_advance = @intCast(font.ft_face.*.size.*.metrics.max_advance >> 6),
         .ascender = @intCast(font.ft_face.*.size.*.metrics.ascender >> 6),
         .descender = @intCast(font.ft_face.*.size.*.metrics.descender >> 6),
+        .underline_position = @intCast(font.ft_face.*.underline_position >> 6),
+        .underline_thickness = @intCast(font.ft_face.*.underline_thickness >> 6),
     };
 }
 

@@ -160,10 +160,6 @@ pub fn main(init: std.process.Init) !void {
     bold_italic_font.italic = true;
     bold_italic_font.weight = .bold;
 
-    const font_metrics = try render.getFontMetrics(.{ .name = regular_font.name, .size = regular_font.size });
-    const cell_width: u32 = @intCast(font_metrics.max_advance);
-    const cell_height: u32 = @intCast(font_metrics.height);
-
     var term = try Term.init(
         init.gpa,
         &render,
@@ -172,10 +168,8 @@ pub fn main(init: std.process.Init) !void {
         italic_font,
         bold_italic_font,
         Pallete.init,
-        @divFloor(1240, cell_width),
-        @divFloor(720, cell_height),
-        cell_width,
-        cell_height,
+        1240,
+        720,
     );
     defer term.deinit();
 
@@ -184,7 +178,8 @@ pub fn main(init: std.process.Init) !void {
 
     var scratch_alloc = std.heap.ArenaAllocator.init(init.gpa);
     defer scratch_alloc.deinit();
-    var frame = false;
+    var presented = false;
+    var resized_event: ?Event.WindowResized = null;
 
     mainloop: while (true) {
         std.debug.assert(scratch_alloc.reset(.{ .retain_with_limit = 1024 * 64 }));
@@ -194,10 +189,8 @@ pub fn main(init: std.process.Init) !void {
             switch (ev) {
                 .window_close_requested => break :mainloop,
                 .window_resized => |resized_ev| {
-                    const cols = @divFloor(resized_ev.width, @as(u32, @intCast(font_metrics.max_advance)));
-                    const rows = @divFloor(resized_ev.height, @as(u32, @intCast(font_metrics.height)));
-                    tty.resize(resized_ev.width, resized_ev.height, cols, rows);
-                    try term.resize(cols, rows);
+                    term.need_redraw = true;
+                    resized_event = resized_ev;
                 },
                 .text_input_preedit_changed => |t| log.debug("text input preedit event \"{s}\"", .{t}),
                 .text_input_changed => |t| {
@@ -217,14 +210,19 @@ pub fn main(init: std.process.Init) !void {
                         else => return err,
                     }
                 },
-                .frame => frame = true,
+                .frame => presented = true,
                 else => {},
             }
         }
 
-        if (term.need_redraw and frame) {
+        if (term.need_redraw and presented) {
+            if (resized_event) |ev| {
+                try term.resize(ev.width, ev.height);
+                tty.resize(ev.width, ev.height, @intCast(term.cols), @intCast(term.rows));
+                resized_event = null;
+            }
             try draw(scratch_alloc.allocator(), &render, &term);
-            frame = false;
+            presented = false;
         }
     }
 }
@@ -235,12 +233,12 @@ fn draw(scratch: std.mem.Allocator, render: *Render, term: *Term) !void {
         try render.fill(image, term.pallete.default_background);
         try term.draw(scratch);
         try render.drawImage(image, .{
-            .src = term.image,
-            .dst_rect = .{
+            .src = .{ .image = term.image },
+            .rect = .{
                 .x = 0,
                 .y = 0,
-                .width = @intCast(term.width * term.cell_width),
-                .height = @intCast(term.height * term.cell_height),
+                .width = @intCast(term.pixel_width),
+                .height = @intCast(term.pixel_height),
             },
             .blend = .none,
         });
