@@ -133,7 +133,7 @@ const Escape = struct {
 
 pub fn main(init: std.process.Init) !void {
     var platform: Platform = undefined;
-    platform.init(init.gpa, 1240, 720);
+    platform.init(init.gpa, init.io, 1240, 720);
     defer platform.deinit();
 
     platform.setTitle("hello world");
@@ -175,6 +175,11 @@ pub fn main(init: std.process.Init) !void {
 
     var tty: Tty = undefined;
     try tty.init(init.io, init.environ_map, &platform, &term);
+    defer tty.deinit(init.io);
+
+    var tty_writer_buf: [4096]u8 = undefined;
+    var tty_writer_impl = tty.master.writer(init.io, &tty_writer_buf);
+    const tty_writer = &tty_writer_impl.interface;
 
     var scratch_alloc = std.heap.ArenaAllocator.init(init.gpa);
     defer scratch_alloc.deinit();
@@ -183,7 +188,7 @@ pub fn main(init: std.process.Init) !void {
 
     mainloop: while (true) {
         std.debug.assert(scratch_alloc.reset(.{ .retain_with_limit = 1024 * 64 }));
-        if (tty.closed) break;
+        if (tty.isClosed()) break;
         platform.pumpEvents();
         while (platform.pollEvent()) |ev| {
             switch (ev) {
@@ -195,43 +200,51 @@ pub fn main(init: std.process.Init) !void {
                 .text_input_preedit_changed => |t| log.debug("text input preedit event \"{s}\"", .{t}),
                 .text_input_changed => |t| {
                     if (!std.mem.eql(u8, t, &.{std.ascii.control_code.del})) {
-                        try tty.writer.writeAll(t);
-                        try tty.writer.flush();
+                        try tty_writer.writeAll(t);
+                        try tty_writer.flush();
                     }
                 },
                 .keyboard_key_down => |key_ev| {
                     const modifier = Escape.parseModifier(key_ev.modifiers);
                     var buf: [32]u8 = undefined;
                     if (Escape.toString(&buf, key_ev.key, modifier)) |t| {
-                        try tty.writer.writeAll(t);
-                        try tty.writer.flush();
+                        try tty_writer.writeAll(t);
+                        try tty_writer.flush();
                     } else |err| switch (err) {
                         error.InvalidKey => {},
                         else => return err,
                     }
                 },
                 .frame => presented = true,
+                // .frame => {
+                //     if (resized_event) |resized_ev| {
+                //         try term.resize(resized_ev.width, resized_ev.height);
+                //         tty.resize(resized_ev.width, resized_ev.height, @intCast(term.cols), @intCast(term.rows));
+                //         resized_event = null;
+                //     }
+                //     try draw(scratch_alloc.allocator(), init.io, &render, &term);
+                // },
                 else => {},
             }
         }
 
         if (term.need_redraw and presented) {
             if (resized_event) |ev| {
-                try term.resize(ev.width, ev.height);
+                try term.resize(init.io, ev.width, ev.height);
                 tty.resize(ev.width, ev.height, @intCast(term.cols), @intCast(term.rows));
                 resized_event = null;
             }
-            try draw(scratch_alloc.allocator(), &render, &term);
+            try draw(scratch_alloc.allocator(), init.io, &render, &term);
             presented = false;
         }
     }
 }
 
-fn draw(scratch: std.mem.Allocator, render: *Render, term: *Term) !void {
+fn draw(scratch: std.mem.Allocator, io: std.Io, render: *Render, term: *Term) !void {
     if (try render.startDraw()) |image| {
         defer render.endDraw(image) catch {};
         try render.fill(image, term.pallete.default_background);
-        try term.draw(scratch);
+        try term.draw(scratch, io);
         try render.drawImage(image, .{
             .src = .{ .image = term.image },
             .rect = .{

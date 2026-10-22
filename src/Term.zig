@@ -1,6 +1,6 @@
 const std = @import("std");
 
-const AllocQueue = @import("core/queue.zig").AllocQueue;
+const Queue = @import("core/queue.zig").Queue;
 const Render = @import("Render.zig");
 const ARGB = @import("colors.zig").ARGB;
 const Pallete = @import("colors.zig").Pallete;
@@ -253,14 +253,17 @@ cursor: Cursor = .{},
 dec_cursor: Cursor = .{},
 sco_cursor: Cursor = .{},
 
-screen: AllocQueue(Row),
-scrollback: AllocQueue(Row),
+screen_buf: []Row = undefined,
+screen: Queue(Row) = undefined,
+scrollback_buf: []Row = undefined,
+scrollback: Queue(Row) = undefined,
 
 regular_font: Font,
 bold_font: Font,
 italic_font: Font,
 bold_italic_font: Font,
 
+mutex: std.Io.Mutex = .init,
 need_redraw: bool = false,
 
 pub fn init(
@@ -310,8 +313,6 @@ pub fn init(
         .pallete = pallete,
         .render = render,
         .image = try render.createImage(pixel_width, pixel_height),
-        .screen = try .init(allocator, rows),
-        .scrollback = try .init(allocator, scrollback_capacity),
         .pixel_width = pixel_width,
         .pixel_height = pixel_height,
         .cell_width = cell_width,
@@ -322,12 +323,18 @@ pub fn init(
         .underline_thickness = underline_thickness,
         .underline_height = underline_height,
     };
+
+    self.screen_buf = try allocator.alloc(Row, rows);
+    self.screen = .init(self.screen_buf);
+    self.scrollback_buf = try allocator.alloc(Row, scrollback_capacity);
+    self.scrollback = .init(self.scrollback_buf);
     self.resetStyle();
     try self.render.fill(self.image, self.pallete.default_background);
     while (!self.screen.isFull()) {
         self.screen.putBack(try .init(allocator, cols)) catch unreachable;
     }
     try self.createUnderlineMask();
+
     return self;
 }
 
@@ -342,8 +349,8 @@ pub fn deinit(self: *Term) void {
     while (iter.next()) |row| {
         row.deinit(self.allocator);
     }
-    self.scrollback.deinit();
-    self.screen.deinit();
+    self.allocator.free(self.screen_buf);
+    self.allocator.free(self.scrollback_buf);
 }
 
 const WindowIterator = struct {
@@ -393,8 +400,8 @@ const RowIterator = struct {
     cursor: Cursor,
     dec_cursor: Cursor,
     sco_cursor: Cursor,
-    screen_iter: AllocQueue(Row).Iterator,
-    scrollback_iter: AllocQueue(Row).Iterator,
+    screen_iter: Queue(Row).Iterator,
+    scrollback_iter: Queue(Row).Iterator,
     i: usize = 0,
 
     pub fn init(self: *RowIterator, term: *const Term) void {
@@ -450,7 +457,10 @@ const VirtualRow = struct {
     }
 };
 
-pub fn resize(self: *Term, width: usize, height: usize) !void {
+pub fn resize(self: *Term, io: std.Io, width: usize, height: usize) !void {
+    try self.mutex.lock(io);
+    defer self.mutex.unlock(io);
+
     self.need_redraw = true;
 
     const cols = @divFloor(width, self.cell_width);
@@ -497,6 +507,16 @@ pub fn resize(self: *Term, width: usize, height: usize) !void {
                         new_row.cursor_offset = offset - window_start;
                     }
                 }
+                if (virtual_row.dec_cursor_offset) |offset| {
+                    if (offset >= window_start and offset < window_end) {
+                        new_row.dec_cursor_offset = offset - window_start;
+                    }
+                }
+                if (virtual_row.sco_cursor_offset) |offset| {
+                    if (offset >= window_start and offset < window_end) {
+                        new_row.sco_cursor_offset = offset - window_start;
+                    }
+                }
 
                 try virtual_rows.append(self.allocator, new_row);
             }
@@ -522,15 +542,16 @@ pub fn resize(self: *Term, width: usize, height: usize) !void {
     while (queue_iter.next()) |row| {
         row.deinit(self.allocator);
     }
-    self.scrollback.deinit();
+    self.scrollback.clear();
 
     queue_iter = self.screen.iterator();
     while (queue_iter.next()) |row| {
         row.deinit(self.allocator);
     }
-    self.screen.deinit();
+    self.allocator.free(self.screen_buf);
+    self.screen_buf = try self.allocator.alloc(Row, rows);
+    self.screen = .init(self.screen_buf);
 
-    self.scrollback = try .init(self.allocator, scrollback_capacity);
     for (scrollback_slice) |*current_virtual_row| {
         if (self.scrollback.isFull()) {
             const removed = self.scrollback.takeFront().?;
@@ -540,10 +561,23 @@ pub fn resize(self: *Term, width: usize, height: usize) !void {
         current_virtual_row.cells.deinit(self.allocator);
     }
 
-    self.screen = try .init(self.allocator, rows);
     for (screen_slice, 0..) |*current_virtual_row, y| {
         if (current_virtual_row.cursor_offset) |x| {
             self.cursor = .{
+                .x = x,
+                .y = y,
+                .wrap_pending = self.cursor.wrap_pending and x == cols - 1,
+            };
+        }
+        if (current_virtual_row.dec_cursor_offset) |x| {
+            self.dec_cursor = .{
+                .x = x,
+                .y = y,
+                .wrap_pending = self.cursor.wrap_pending and x == cols - 1,
+            };
+        }
+        if (current_virtual_row.sco_cursor_offset) |x| {
+            self.sco_cursor = .{
                 .x = x,
                 .y = y,
                 .wrap_pending = self.cursor.wrap_pending and x == cols - 1,
@@ -555,6 +589,21 @@ pub fn resize(self: *Term, width: usize, height: usize) !void {
     while (!self.screen.isFull()) {
         self.screen.putBack(try .init(self.allocator, cols)) catch unreachable;
     }
+
+    self.cursor = .{
+        .x = std.math.clamp(self.cursor.x, 0, cols - 1),
+        .y = std.math.clamp(self.cursor.y, 0, rows - 1),
+    };
+
+    self.dec_cursor = .{
+        .x = std.math.clamp(self.dec_cursor.x, 0, cols - 1),
+        .y = std.math.clamp(self.dec_cursor.y, 0, rows - 1),
+    };
+
+    self.sco_cursor = .{
+        .x = std.math.clamp(self.sco_cursor.x, 0, cols - 1),
+        .y = std.math.clamp(self.sco_cursor.y, 0, rows - 1),
+    };
 
     self.rows = rows;
     self.cols = cols;
@@ -783,7 +832,10 @@ pub fn eraseAllLine(self: *Term) !void {
     row.eraseAll();
 }
 
-pub fn draw(self: *Term, allocator: std.mem.Allocator) !void {
+pub fn draw(self: *Term, allocator: std.mem.Allocator, io: std.Io) !void {
+    try self.mutex.lock(io);
+    defer self.mutex.unlock(io);
+
     self.need_redraw = false;
     var accum = std.Io.Writer.Allocating.init(allocator);
     var row_index: usize = 0;

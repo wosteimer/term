@@ -144,7 +144,10 @@ pub fn init(writer: *std.Io.Writer, term: *Term, platform: *Platform) Ansi {
     };
 }
 
-pub fn parse(self: *Ansi, input: []const u8) !usize {
+pub fn parse(self: *Ansi, io: std.Io, input: []const u8) !usize {
+    try self.term.mutex.lock(io);
+    defer self.term.mutex.unlock(io);
+
     var iter = SimdSplitControlIterator{ .input = input };
     var rest: usize = 0;
 
@@ -164,6 +167,7 @@ pub fn parse(self: *Ansi, input: []const u8) !usize {
                         ) orelse {
                             // INFO: incomplete escape code wait for next chunk to parse
                             rest = text.len + 1;
+                            log.debug("escape code incomplete: {f}{s}", .{ std.ascii.hexEscape(&.{current.control orelse 0}, .upper), text });
                             break;
                         };
                         escape_last_char_index += offset;
@@ -182,6 +186,7 @@ pub fn parse(self: *Ansi, input: []const u8) !usize {
                                 ) orelse {
                                     // INFO: incomplete escape code wait for next chunk to parse
                                     rest = text.len + 1;
+                                    log.debug("escape code incomplete: {f}{s}", .{ std.ascii.hexEscape(&.{current.control orelse 0}, .upper), text });
                                     break;
                                 };
                                 escape_last_char_index += offset;
@@ -197,6 +202,7 @@ pub fn parse(self: *Ansi, input: []const u8) !usize {
                                 ) orelse {
                                     // INFO: incomplete escape code wait for next chunk to parse
                                     rest = text.len + 1;
+                                    log.debug("escape code incomplete: {f}{s}", .{ std.ascii.hexEscape(&.{current.control orelse 0}, .upper), text });
                                     break;
                                 };
                                 escape_last_char_index += offset;
@@ -215,12 +221,14 @@ pub fn parse(self: *Ansi, input: []const u8) !usize {
                     } else {
                         // INFO: incomplete escape code wait for next chunk to parse
                         rest = text.len + 1;
+                        log.debug("escape code incomplete: {f}{s}", .{ std.ascii.hexEscape(&.{current.control orelse 0}, .upper), text });
                         break;
                     },
                     ']' => {
                         if (!self.parseOSC(text[1..])) {
                             // INFO: incomplete escape code wait for next chunk to parse
                             rest = text.len + 1;
+                            log.debug("escape code incomplete: {f}{s}", .{ std.ascii.hexEscape(&.{current.control orelse 0}, .upper), text });
                             break;
                         }
                         text_start = text.len;
@@ -243,6 +251,7 @@ pub fn parse(self: *Ansi, input: []const u8) !usize {
             } else {
                 // INFO: incomplete escape code wait for next chunk to parse
                 rest = 1;
+                log.debug("escape code incomplete: {f}{s}", .{ std.ascii.hexEscape(&.{current.control orelse 0}, .upper), text });
                 break;
             },
             std.ascii.control_code.bs => self.term.moveCursor(1, .left),
@@ -463,6 +472,11 @@ pub fn parseOSC(self: *Ansi, input: []const u8) bool {
     if (input.len < 3) return false;
     if (std.mem.startsWith(u8, input, "0;")) {
         self.platform.setTitle(input[2..]);
+        return true;
+    }
+    if (std.mem.findScalar(u8, input, ';')) |_| {
+        // HACK: currently just ignoring this ansi sequence
+        log.warn("escape code ignored: ESC]{s}", .{input});
         return true;
     }
     return false;

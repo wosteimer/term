@@ -7,6 +7,7 @@ const Button = @import("common.zig").Button;
 const Key = @import("common.zig").Key;
 const Modifiers = @import("common.zig").Modifiers;
 const Event = @import("common.zig").Event;
+const ThreadSafeQueue = @import("../core/queue.zig").ThreadSafeQueue;
 const Queue = @import("../core/queue.zig").Queue;
 const DateTime = @import("../core/DateTime.zig").DateTime;
 const FdListenerCallback = @import("common.zig").FdListenerCallback;
@@ -188,15 +189,19 @@ zxdg_toplevel_decoration_v1: ?*c.zxdg_toplevel_decoration_v1 = null,
 wp_tearing_control_manager_v1: ?*c.wp_tearing_control_manager_v1 = null,
 wp_tearing_control_v1: ?*c.wp_tearing_control_v1 = null,
 
-events: Queue(Event, 256) = .empty,
+io: std.Io,
+events_buf: [256]Event = undefined,
+events: ThreadSafeQueue(Event) = undefined,
 clk_id: std.os.linux.clockid_t = @enumFromInt(0),
-next_refresh: u64 = 0,
 resize_pending: bool = false,
 title: [4096:0]u8 = .{0} ** 4096,
 width: u32 = 200,
 height: u32 = 200,
-buffers_queue: Queue(Buffer, buffers_len) = .empty,
-buffers: [buffers_len]InternalBuffer = [_]InternalBuffer{.{}} ** buffers_len,
+
+buffers_queue_buf: [buffers_len]Buffer = undefined,
+buffers_queue: Queue(Buffer) = undefined,
+buffers: [buffers_len]InternalBuffer = @splat(.{}),
+
 min_width: u32 = 0,
 min_height: u32 = 0,
 max_width: u32 = 0,
@@ -220,15 +225,18 @@ keyboard_last_key: u32 = 0,
 keyboard_repeat_mode: bool = false,
 keyboard_repeat_rate: u32 = 0,
 keyboard_repeat_delay: u32 = 0,
+keyboard_repeat_future: ?std.Io.Future(std.Io.Cancelable!void) = null,
 text_input_enabled: bool = false,
 text_input_buf: [text_input_buf_len:0]u8 = .{0} ** text_input_buf_len,
 text_input_timer_fd: std.os.linux.fd_t = -1,
 
-pub fn init(self: *Self, allocator: std.mem.Allocator, initial_width: u32, initial_height: u32) void {
-    self.* = .{};
+pub fn init(self: *Self, allocator: std.mem.Allocator, io: std.Io, initial_width: u32, initial_height: u32) void {
+    self.* = .{ .io = io };
+    self.events = .init(&self.events_buf);
 
+    self.buffers_queue = .init(&self.buffers_queue_buf);
     for (0..buffers_len) |i| {
-        self.buffers_queue.put(Buffer{ .handler = @intCast(i) }) catch unreachable;
+        self.buffers_queue.putBack(Buffer{ .handler = @intCast(i) }) catch unreachable;
     }
 
     self.width = initial_width;
@@ -322,6 +330,10 @@ pub fn deinit(self: *Self) void {
 
     self.fd_map.deinit();
 
+    if (self.keyboard_repeat_future) |*future| {
+        future.cancel(self.io) catch {};
+    }
+
     cleanup(c.wl_shm_pool_destroy, &self.wl_shm_pool, .{});
     cleanup(c.wl_keyboard_destroy, &self.wl_keyboard, .{});
     cleanup(c.wl_pointer_destroy, &self.wl_pointer, .{});
@@ -365,7 +377,7 @@ fn wlCallbackDone(user_data: ?*anyopaque, wl_callback: ?*c.wl_callback, callback
     _ = callback_data;
     const self: *Self = @ptrCast(@alignCast(user_data));
 
-    self.events.put(.{ .frame = {} }) catch {
+    self.events.putBack(self.io, .{ .frame = {} }) catch {
         log.warn("Event queue full, a frame discarted event missed", .{});
     };
 
@@ -507,7 +519,7 @@ pub fn getSize(self: *Self) Size {
 }
 
 pub fn getBuffer(self: *Self) ?Buffer {
-    return self.buffers_queue.take();
+    return self.buffers_queue.takeFront();
 }
 
 pub fn getBufferPixels(self: *Self, buffer: Buffer) []u32 {
@@ -517,141 +529,14 @@ pub fn getBufferPixels(self: *Self, buffer: Buffer) []u32 {
 }
 
 pub fn pumpEvents(self: *Self) void {
-    self.events.clear();
-
-    const wayland_fd = c.wl_display_get_fd(self.wl_display);
-    const events_capacity = 32;
-    var wayland_readable: bool = false;
-    var events: [events_capacity]std.os.linux.epoll_event = undefined;
-
-    _ = c.wl_display_dispatch_pending(self.wl_display);
-    while (c.wl_display_prepare_read(self.wl_display) != 0) {
-        _ = c.wl_display_dispatch_pending(self.wl_display);
-    }
-    _ = c.wl_display_flush(self.wl_display);
-
-    const events_len = std.os.linux.epoll_wait(self.epoll_fd, &events, events_capacity, -1);
-    for (events[0..events_len]) |event| {
-        if (event.data.fd == wayland_fd) {
-            wayland_readable = true;
-        } else if (event.data.fd == self.text_input_timer_fd) {
-            var expirations: u64 = undefined;
-            _ = std.os.linux.read(self.text_input_timer_fd, std.mem.asBytes(&expirations), @sizeOf(u64));
-            self.events.put(.{ .keyboard_key_down = .{
-                .key = evdev_to_key[self.keyboard_last_key],
-                .modifiers = self.getKeyboardModifiers(),
-                .raw = self.keyboard_last_key,
-                .repeat = true,
-            } }) catch log.warn("Event queue full, a key down event missed", .{});
-            if (self.text_input_enabled and self.text_input_buf[0] != 0) {
-                self.events.put(.{
-                    .text_input_changed = std.mem.sliceTo(&self.text_input_buf, 0),
-                }) catch {
-                    log.warn("Event queue full, a text input event missed", .{});
-                };
-            }
-            c.xkb_compose_state_reset(self.xkb_compose_state);
-        } else {
-            var event_type: Event.Fd.Type = undefined;
-            if (event.events & std.os.linux.EPOLL.IN == std.os.linux.EPOLL.IN) {
-                event_type = .in;
-            } else if (event.events & std.os.linux.EPOLL.OUT == std.os.linux.EPOLL.OUT) {
-                event_type = .out;
-            } else if (event.events & std.os.linux.EPOLL.ERR == std.os.linux.EPOLL.ERR) {
-                event_type = .err;
-            } else if (event.events & std.os.linux.EPOLL.HUP == std.os.linux.EPOLL.HUP) {
-                event_type = .hup;
-            }
-            self.events.put(.{ .fd = .{
-                .fd = @intCast(event.data.fd),
-                .type = event_type,
-            } }) catch {
-                log.warn("Event queue full, a fd event missed", .{});
-            };
-            if (self.fd_map.get(event.data.fd)) |entry| {
-                entry.callback(entry.user_data, event_type);
-            }
-        }
-    }
-
-    if (wayland_readable) {
-        _ = c.wl_display_read_events(self.wl_display);
-        _ = c.wl_display_dispatch_pending(self.wl_display);
-    } else {
-        _ = c.wl_display_cancel_read(self.wl_display);
-    }
+    self.events.clear(self.io) catch unreachable;
+    const ticks_per_second = 60;
+    const timeout = std.time.ns_per_s / ticks_per_second;
+    _ = c.wl_display_dispatch_timeout(self.wl_display, &.{ .tv_nsec = timeout, .tv_sec = 0 });
 }
 
 pub fn pollEvent(self: *Self) ?Event {
-    return self.events.take();
-}
-
-pub const FdEventsFlags = packed struct {
-    in: bool = false,
-    out: bool = false,
-    err: bool = false,
-    hup: bool = false,
-};
-
-pub fn addFdListener(
-    self: *Self,
-    fd: i32,
-    events: FdEventsFlags,
-    callback: ?FdListenerCallback,
-    user_data: ?*anyopaque,
-) error{ InvalidFd, AlreadyRegistered, OutOfMemory }!void {
-    var flags: u32 = 0;
-    if (events.in) flags |= std.os.linux.EPOLL.IN;
-    if (events.out) flags |= std.os.linux.EPOLL.OUT;
-    if (events.err) flags |= std.os.linux.EPOLL.ERR;
-    if (events.hup) flags |= std.os.linux.EPOLL.HUP;
-
-    var event: std.os.linux.epoll_event = .{
-        .data = .{ .fd = fd },
-        .events = flags,
-    };
-
-    const ok = std.os.linux.epoll_ctl(self.epoll_fd, std.os.linux.EPOLL.CTL_ADD, fd, &event);
-    switch (std.os.linux.errno(ok)) {
-        .SUCCESS => {},
-        .EXIST => return error.AlreadyRegistered,
-        else => return error.InvalidFd,
-    }
-
-    if (callback) |cb| {
-        try self.fd_map.put(fd, .{ .callback = cb, .user_data = user_data });
-    }
-}
-
-pub fn modifyFdListener(self: *Self, fd: i32, events: FdEventsFlags) error{ InvalidFd, NotRegistered }!void {
-    var flags: u32 = 0;
-    if (events.in) flags |= std.os.linux.EPOLL.IN;
-    if (events.out) flags |= std.os.linux.EPOLL.OUT;
-    if (events.err) flags |= std.os.linux.EPOLL.ERR;
-    if (events.hup) flags |= std.os.linux.EPOLL.HUP;
-
-    var event: std.os.linux.epoll_event = .{
-        .data = .{ .fd = fd },
-        .events = flags,
-    };
-
-    const ok = std.os.linux.epoll_ctl(self.epoll_fd, std.os.linux.EPOLL.CTL_MOD, fd, &event);
-    switch (std.os.linux.errno(ok)) {
-        .SUCCESS => {},
-        .NOENT => return error.NotRegistered,
-        else => return error.InvalidFd,
-    }
-}
-
-pub fn removeFdListener(self: *Self, fd: i32) error{ InvalidFd, NotRegistered }!void {
-    const ok = std.os.linux.epoll_ctl(self.epoll_fd, std.os.linux.EPOLL.CTL_DEL, fd, null);
-    switch (std.os.linux.errno(ok)) {
-        .SUCCESS => {},
-        .NOENT => return error.NotRegistered,
-        else => return error.InvalidFd,
-    }
-
-    _ = self.fd_map.remove(fd);
+    return self.events.takeFront(self.io) catch unreachable;
 }
 
 pub fn setPointerShape(self: *Self, shape: Shape) void {
@@ -792,7 +677,7 @@ fn xdgSurfaceConfigure(user_data: ?*anyopaque, xdg_surface: ?*c.xdg_surface, ser
     c.xdg_surface_ack_configure(xdg_surface, serial);
     if (self.wl_shm_pool == null) {
         createBuffers(self);
-        const buffer = self.buffers_queue.take() orelse unreachable;
+        const buffer = self.buffers_queue.takeFront() orelse unreachable;
 
         const callback = c.wl_surface_frame(self.wl_surface);
         _ = c.wl_callback_add_listener(callback, &wl_callback_listener, self);
@@ -801,7 +686,8 @@ fn xdgSurfaceConfigure(user_data: ?*anyopaque, xdg_surface: ?*c.xdg_surface, ser
         c.wl_surface_damage(self.wl_surface, 0, 0, std.math.maxInt(i32), std.math.maxInt(i32));
         c.wl_surface_commit(self.wl_surface);
     } else if (self.resize_pending) {
-        self.events.put(
+        self.events.putBack(
+            self.io,
             .{
                 .window_resized = .{
                     .width = self.width,
@@ -868,14 +754,14 @@ fn createBuffers(self: *Self) void {
             .pixels = self.pixels.?[@intCast(width * height * @as(i32, @intCast(i)))..],
         };
         _ = c.wl_buffer_add_listener(self.buffers[i].wl_buffer, &wl_buffer_listener, &self.buffers[i]);
-        self.buffers_queue.put(.{ .handler = @intCast(i) }) catch unreachable;
+        self.buffers_queue.putBack(.{ .handler = @intCast(i) }) catch unreachable;
     }
 }
 
 fn xdgToplevelClose(user_data: ?*anyopaque, toplevel: ?*c.xdg_toplevel) callconv(.c) void {
     _ = toplevel;
     const self: *Self = @ptrCast(@alignCast(user_data));
-    self.events.put(.{ .window_close_requested = {} }) catch {
+    self.events.putBack(self.io, .{ .window_close_requested = {} }) catch {
         log.warn("Event queue full, event closing missed", .{});
     };
     log.debug("xdgToplevelClose", .{});
@@ -923,7 +809,7 @@ fn xdgToplevelWmCapabilities(
 fn wlBufferRelease(user_data: ?*anyopaque, wl_buffer: ?*c.wl_buffer) callconv(.c) void {
     _ = wl_buffer;
     const buffer: *InternalBuffer = @ptrCast(@alignCast(user_data));
-    buffer.platform.buffers_queue.put(Buffer{ .handler = buffer.index }) catch unreachable;
+    buffer.platform.buffers_queue.putBack(Buffer{ .handler = buffer.index }) catch unreachable;
 }
 
 pub fn wlKeyboardEnter(
@@ -942,7 +828,7 @@ pub fn wlKeyboardEnter(
         const key = evdev_to_key[if (evdev_key < evdev_key_max) evdev_key else 0];
         self.keyboard_self[@intFromEnum(key)] = true;
     }
-    self.events.put(.{
+    self.events.putBack(self.io, .{
         .keyboard_focus = .{ .focus = true },
     }) catch {
         log.warn("Event Queue is full, keyboard focus event missed", .{});
@@ -961,7 +847,7 @@ pub fn wlKeyboardLeave(
     const self: *Self = @ptrCast(@alignCast(user_data));
     self.keyboard_self = .{false} ** keyboard_self_len;
     unsetTextInputTimer(self);
-    self.events.put(.{
+    self.events.putBack(self.io, .{
         .keyboard_focus = .{ .focus = false },
     }) catch {
         log.warn("Event Queue is full, keyboard focus event missed", .{});
@@ -989,7 +875,7 @@ pub fn wlKeyboardKey(
             }
             _ = c.xkb_state_update_key(self.xkb_state, evdev_key + 8, c.XKB_KEY_DOWN);
             self.keyboard_last_key = evdev_key;
-            self.events.put(.{
+            self.events.putBack(self.io, .{
                 .keyboard_key_down = .{
                     .key = key,
                     .repeat = false,
@@ -1013,26 +899,26 @@ pub fn wlKeyboardKey(
             switch (c.xkb_compose_state_get_status(self.xkb_compose_state)) {
                 c.XKB_COMPOSE_COMPOSED => {
                     if (c.xkb_compose_state_get_utf8(self.xkb_compose_state, &self.text_input_buf, self.text_input_buf.len) > 0) {
-                        self.events.put(.{ .text_input_changed = std.mem.sliceTo(&self.text_input_buf, 0) }) catch {
+                        self.events.putBack(self.io, .{ .text_input_changed = std.mem.sliceTo(&self.text_input_buf, 0) }) catch {
                             log.warn("Event queue full, a text input event missed", .{});
                         };
                     }
                 },
                 c.XKB_COMPOSE_NOTHING => {
                     if (c.xkb_state_key_get_utf8(self.xkb_state, evdev_key + 8, &self.text_input_buf, self.text_input_buf.len) > 0) {
-                        self.events.put(.{ .text_input_changed = std.mem.sliceTo(&self.text_input_buf, 0) }) catch {
+                        self.events.putBack(self.io, .{ .text_input_changed = std.mem.sliceTo(&self.text_input_buf, 0) }) catch {
                             log.warn("Event queue full, a text input event missed", .{});
                         };
                     }
                 },
                 c.XKB_COMPOSE_COMPOSING => {
                     _ = getUtf8FromKeysym(&self.text_input_buf, keysym);
-                    self.events.put(.{ .text_input_preedit_changed = std.mem.sliceTo(&self.text_input_buf, 0) }) catch {
+                    self.events.putBack(self.io, .{ .text_input_preedit_changed = std.mem.sliceTo(&self.text_input_buf, 0) }) catch {
                         log.warn("Event queue full, a text input event missed", .{});
                     };
                 },
                 c.XKB_COMPOSE_CANCELLED => {
-                    self.events.put(.{ .text_input_preedit_cancel = {} }) catch {
+                    self.events.putBack(self.io, .{ .text_input_preedit_cancel = {} }) catch {
                         log.warn("Event queue full, a text input event missed", .{});
                     };
                     self.text_input_buf = .{0} ** text_input_buf_len;
@@ -1045,7 +931,7 @@ pub fn wlKeyboardKey(
                 unsetTextInputTimer(self);
             }
             _ = c.xkb_state_update_key(self.xkb_state, evdev_key + 8, c.XKB_KEY_UP);
-            self.events.put(.{
+            self.events.putBack(self.io, .{
                 .keyboard_key_up = .{
                     .key = key,
                     .modifiers = modifiers,
@@ -1064,36 +950,40 @@ pub fn wlKeyboardKey(
 }
 
 fn setTextInputTimer(self: *Self) void {
-    const delay_ns = self.keyboard_repeat_delay * std.time.ns_per_ms;
-    const interval_ns = std.time.ns_per_s / self.keyboard_repeat_rate;
-
-    const timer_spec = std.os.linux.itimerspec{
-        .it_value = .{
-            .sec = @intCast(delay_ns / std.time.ns_per_s),
-            .nsec = @intCast(delay_ns % std.time.ns_per_s),
-        },
-        .it_interval = .{
-            .sec = @intCast(interval_ns / std.time.ns_per_s),
-            .nsec = @intCast(interval_ns % std.time.ns_per_s),
-        },
-    };
-    const ok = std.os.linux.timerfd_settime(
-        self.text_input_timer_fd,
-        std.os.linux.TFD.TIMER{},
-        &timer_spec,
-        null,
-    );
-    std.debug.assert(ok != -1);
+    if (self.keyboard_repeat_future) |*future| {
+        future.cancel(self.io) catch {};
+    }
+    self.keyboard_repeat_future = self.io.concurrent(keyRepeat, .{self}) catch unreachable;
 }
 
 fn unsetTextInputTimer(self: *Self) void {
-    const ok = std.os.linux.timerfd_settime(
-        self.text_input_timer_fd,
-        std.os.linux.TFD.TIMER{},
-        &std.mem.zeroes(std.os.linux.itimerspec),
-        null,
-    );
-    std.debug.assert(ok != -1);
+    if (self.keyboard_repeat_future) |*future| {
+        future.cancel(self.io) catch {};
+        self.keyboard_repeat_future = null;
+    }
+}
+
+fn keyRepeat(self: *Self) std.Io.Cancelable!void {
+    const delay_ns = self.keyboard_repeat_delay * std.time.ns_per_ms;
+    const interval_ns = std.time.ns_per_s / self.keyboard_repeat_rate;
+
+    try std.Io.sleep(self.io, .fromNanoseconds(delay_ns), .awake);
+    while (true) : (try std.Io.sleep(self.io, .fromNanoseconds(interval_ns), .awake)) {
+        self.events.putBack(self.io, .{ .keyboard_key_down = .{
+            .key = evdev_to_key[self.keyboard_last_key],
+            .modifiers = self.getKeyboardModifiers(),
+            .raw = self.keyboard_last_key,
+            .repeat = true,
+        } }) catch log.warn("Event queue full, a key down event missed", .{});
+        if (self.text_input_enabled and self.text_input_buf[0] != 0) {
+            self.events.putBack(self.io, .{
+                .text_input_changed = std.mem.sliceTo(&self.text_input_buf, 0),
+            }) catch {
+                log.warn("Event queue full, a text input event missed", .{});
+            };
+        }
+        c.xkb_compose_state_reset(self.xkb_compose_state);
+    }
 }
 
 fn makeModifiers(self: *Self) Modifiers {
@@ -1269,7 +1159,7 @@ fn wlPointerButton(
     };
     if (pointer_self == c.WL_POINTER_BUTTON_STATE_PRESSED) {
         self.pointer_self[@intFromEnum(mapped_button)] = true;
-        self.events.put(.{ .pointer_button_down = .{
+        self.events.putBack(self.io, .{ .pointer_button_down = .{
             .button = mapped_button,
             .raw = button,
         } }) catch {
@@ -1278,7 +1168,7 @@ fn wlPointerButton(
         return;
     }
     self.pointer_self[@intFromEnum(mapped_button)] = false;
-    self.events.put(.{ .pointer_button_up = .{
+    self.events.putBack(self.io, .{ .pointer_button_up = .{
         .button = mapped_button,
         .raw = button,
     } }) catch {
@@ -1304,7 +1194,7 @@ fn wlPointerFrame(data: ?*anyopaque, wl_pointer: ?*c.wl_pointer) callconv(.c) vo
     _ = wl_pointer;
     const self: *Self = @ptrCast(@alignCast(data));
     if (self.pointer_position_changed) {
-        self.events.put(.{ .pointer_motion = .{
+        self.events.putBack(self.io, .{ .pointer_motion = .{
             .x = self.pointer_position_x,
             .y = self.pointer_position_y,
         } }) catch {
@@ -1313,7 +1203,7 @@ fn wlPointerFrame(data: ?*anyopaque, wl_pointer: ?*c.wl_pointer) callconv(.c) vo
         self.pointer_position_changed = false;
     }
     if (self.pointer_axis_changed) {
-        self.events.put(.{ .pointer_wheel = .{
+        self.events.putBack(self.io, .{ .pointer_wheel = .{
             .x = self.pointer_axis_x / 120,
             .y = self.pointer_axis_y / 120,
         } }) catch {
