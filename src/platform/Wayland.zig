@@ -7,7 +7,6 @@ const Button = @import("common.zig").Button;
 const Key = @import("common.zig").Key;
 const Modifiers = @import("common.zig").Modifiers;
 const Event = @import("common.zig").Event;
-const ThreadSafeQueue = @import("../core/queue.zig").ThreadSafeQueue;
 const Queue = @import("../core/queue.zig").Queue;
 const DateTime = @import("../core/DateTime.zig").DateTime;
 const FdListenerCallback = @import("common.zig").FdListenerCallback;
@@ -191,7 +190,7 @@ wp_tearing_control_v1: ?*c.wp_tearing_control_v1 = null,
 
 io: std.Io,
 events_buf: [256]Event = undefined,
-events: ThreadSafeQueue(Event) = undefined,
+events: Queue(Event) = undefined,
 clk_id: std.os.linux.clockid_t = @enumFromInt(0),
 resize_pending: bool = false,
 title: [4096:0]u8 = .{0} ** 4096,
@@ -220,12 +219,13 @@ pointer_axis_changed: bool = false,
 pointer_axis_x: f32 = 0,
 pointer_axis_y: f32 = 0,
 
-keyboard_self: [keyboard_self_len]bool = .{false} ** keyboard_self_len,
+keyboard_state: [keyboard_self_len]bool = .{false} ** keyboard_self_len,
 keyboard_last_key: u32 = 0,
 keyboard_repeat_mode: bool = false,
 keyboard_repeat_rate: u32 = 0,
 keyboard_repeat_delay: u32 = 0,
-keyboard_repeat_future: ?std.Io.Future(std.Io.Cancelable!void) = null,
+keyboard_repeat_state: enum { none, delay, rate } = .none,
+keyboard_repeat_last_tick: std.Io.Timestamp = .{ .nanoseconds = 0 },
 text_input_enabled: bool = false,
 text_input_buf: [text_input_buf_len:0]u8 = .{0} ** text_input_buf_len,
 text_input_timer_fd: std.os.linux.fd_t = -1,
@@ -330,10 +330,6 @@ pub fn deinit(self: *Self) void {
 
     self.fd_map.deinit();
 
-    if (self.keyboard_repeat_future) |*future| {
-        future.cancel(self.io) catch {};
-    }
-
     cleanup(c.wl_shm_pool_destroy, &self.wl_shm_pool, .{});
     cleanup(c.wl_keyboard_destroy, &self.wl_keyboard, .{});
     cleanup(c.wl_pointer_destroy, &self.wl_pointer, .{});
@@ -377,7 +373,7 @@ fn wlCallbackDone(user_data: ?*anyopaque, wl_callback: ?*c.wl_callback, callback
     _ = callback_data;
     const self: *Self = @ptrCast(@alignCast(user_data));
 
-    self.events.putBack(self.io, .{ .frame = {} }) catch {
+    self.events.putBack(.{ .frame = {} }) catch {
         log.warn("Event queue full, a frame discarted event missed", .{});
     };
 
@@ -529,14 +525,59 @@ pub fn getBufferPixels(self: *Self, buffer: Buffer) []u32 {
 }
 
 pub fn pumpEvents(self: *Self) void {
-    self.events.clear(self.io) catch unreachable;
+    self.events.clear();
     const ticks_per_second = 60;
     const timeout = std.time.ns_per_s / ticks_per_second;
     _ = c.wl_display_dispatch_timeout(self.wl_display, &.{ .tv_nsec = timeout, .tv_sec = 0 });
+
+    if (self.keyboard_repeat_mode) {
+        var put_keyboard_events = false;
+        switch (self.keyboard_repeat_state) {
+            .none => {},
+            .delay => {
+                const now = std.Io.Clock.now(.awake, self.io);
+                const next_tick = self.keyboard_repeat_last_tick.addDuration(
+                    .fromMilliseconds(self.keyboard_repeat_delay),
+                );
+                if (now.durationTo(next_tick).toNanoseconds() <= 0) {
+                    self.keyboard_repeat_state = .rate;
+                    self.keyboard_repeat_last_tick = now;
+                    put_keyboard_events = true;
+                }
+            },
+            .rate => {
+                const now = std.Io.Clock.now(.awake, self.io);
+                const next_tick = self.keyboard_repeat_last_tick.addDuration(
+                    .fromMilliseconds(std.time.ms_per_s / self.keyboard_repeat_rate),
+                );
+                if (now.durationTo(next_tick).toNanoseconds() <= 0) {
+                    self.keyboard_repeat_last_tick = now;
+                    put_keyboard_events = true;
+                }
+            },
+        }
+
+        if (put_keyboard_events) {
+            self.events.putBack(.{ .keyboard_key_down = .{
+                .key = evdev_to_key[self.keyboard_last_key],
+                .modifiers = self.getKeyboardModifiers(),
+                .raw = self.keyboard_last_key,
+                .repeat = true,
+            } }) catch log.warn("Event queue full, a key down event missed", .{});
+            if (self.text_input_enabled and self.text_input_buf[0] != 0) {
+                self.events.putBack(.{
+                    .text_input_changed = std.mem.sliceTo(&self.text_input_buf, 0),
+                }) catch {
+                    log.warn("Event queue full, a text input event missed", .{});
+                };
+            }
+            c.xkb_compose_state_reset(self.xkb_compose_state);
+        }
+    }
 }
 
 pub fn pollEvent(self: *Self) ?Event {
-    return self.events.takeFront(self.io) catch unreachable;
+    return self.events.takeFront();
 }
 
 pub fn setPointerShape(self: *Self, shape: Shape) void {
@@ -557,7 +598,7 @@ pub fn buttonIsPressed(self: *Self, button: Button) bool {
 }
 
 pub fn keyIsPressed(self: *Self, key: Key) bool {
-    return self.keyboard_self[@intFromEnum(key)];
+    return self.keyboard_state[@intFromEnum(key)];
 }
 
 pub fn enableKeyboardRepeat(self: *Self) void {
@@ -687,7 +728,6 @@ fn xdgSurfaceConfigure(user_data: ?*anyopaque, xdg_surface: ?*c.xdg_surface, ser
         c.wl_surface_commit(self.wl_surface);
     } else if (self.resize_pending) {
         self.events.putBack(
-            self.io,
             .{
                 .window_resized = .{
                     .width = self.width,
@@ -761,7 +801,7 @@ fn createBuffers(self: *Self) void {
 fn xdgToplevelClose(user_data: ?*anyopaque, toplevel: ?*c.xdg_toplevel) callconv(.c) void {
     _ = toplevel;
     const self: *Self = @ptrCast(@alignCast(user_data));
-    self.events.putBack(self.io, .{ .window_close_requested = {} }) catch {
+    self.events.putBack(.{ .window_close_requested = {} }) catch {
         log.warn("Event queue full, event closing missed", .{});
     };
     log.debug("xdgToplevelClose", .{});
@@ -826,9 +866,9 @@ pub fn wlKeyboardEnter(
     const arr_evdev_keys = @as([*]u32, @ptrCast(@alignCast(evdev_keys.?.data)))[0..evdev_keys.?.size];
     for (arr_evdev_keys) |evdev_key| {
         const key = evdev_to_key[if (evdev_key < evdev_key_max) evdev_key else 0];
-        self.keyboard_self[@intFromEnum(key)] = true;
+        self.keyboard_state[@intFromEnum(key)] = true;
     }
-    self.events.putBack(self.io, .{
+    self.events.putBack(.{
         .keyboard_focus = .{ .focus = true },
     }) catch {
         log.warn("Event Queue is full, keyboard focus event missed", .{});
@@ -845,9 +885,9 @@ pub fn wlKeyboardLeave(
     _ = serial;
     _ = wl_surface;
     const self: *Self = @ptrCast(@alignCast(user_data));
-    self.keyboard_self = .{false} ** keyboard_self_len;
+    self.keyboard_state = .{false} ** keyboard_self_len;
     unsetTextInputTimer(self);
-    self.events.putBack(self.io, .{
+    self.events.putBack(.{
         .keyboard_focus = .{ .focus = false },
     }) catch {
         log.warn("Event Queue is full, keyboard focus event missed", .{});
@@ -860,7 +900,7 @@ pub fn wlKeyboardKey(
     serial: u32,
     time: u32,
     evdev_key: u32,
-    keyboard_self: u32,
+    keyboard_state: u32,
 ) callconv(.c) void {
     _ = wl_keyboard;
     _ = serial;
@@ -868,14 +908,14 @@ pub fn wlKeyboardKey(
     const self: *Self = @ptrCast(@alignCast(user_data));
     const modifiers = makeModifiers(self);
     const key = evdev_to_key[evdev_key];
-    switch (keyboard_self) {
+    switch (keyboard_state) {
         c.WL_KEYBOARD_KEY_STATE_PRESSED => {
             if (self.keyboard_repeat_mode and self.keyboard_repeat_rate > 0) {
                 setTextInputTimer(self);
             }
             _ = c.xkb_state_update_key(self.xkb_state, evdev_key + 8, c.XKB_KEY_DOWN);
             self.keyboard_last_key = evdev_key;
-            self.events.putBack(self.io, .{
+            self.events.putBack(.{
                 .keyboard_key_down = .{
                     .key = key,
                     .repeat = false,
@@ -885,7 +925,7 @@ pub fn wlKeyboardKey(
             }) catch {
                 log.warn("Event Queue is full, key down event missed", .{});
             };
-            self.keyboard_self[@intFromEnum(key)] = true;
+            self.keyboard_state[@intFromEnum(key)] = true;
 
             if (!self.text_input_enabled) return;
 
@@ -899,26 +939,26 @@ pub fn wlKeyboardKey(
             switch (c.xkb_compose_state_get_status(self.xkb_compose_state)) {
                 c.XKB_COMPOSE_COMPOSED => {
                     if (c.xkb_compose_state_get_utf8(self.xkb_compose_state, &self.text_input_buf, self.text_input_buf.len) > 0) {
-                        self.events.putBack(self.io, .{ .text_input_changed = std.mem.sliceTo(&self.text_input_buf, 0) }) catch {
+                        self.events.putBack(.{ .text_input_changed = std.mem.sliceTo(&self.text_input_buf, 0) }) catch {
                             log.warn("Event queue full, a text input event missed", .{});
                         };
                     }
                 },
                 c.XKB_COMPOSE_NOTHING => {
                     if (c.xkb_state_key_get_utf8(self.xkb_state, evdev_key + 8, &self.text_input_buf, self.text_input_buf.len) > 0) {
-                        self.events.putBack(self.io, .{ .text_input_changed = std.mem.sliceTo(&self.text_input_buf, 0) }) catch {
+                        self.events.putBack(.{ .text_input_changed = std.mem.sliceTo(&self.text_input_buf, 0) }) catch {
                             log.warn("Event queue full, a text input event missed", .{});
                         };
                     }
                 },
                 c.XKB_COMPOSE_COMPOSING => {
                     _ = getUtf8FromKeysym(&self.text_input_buf, keysym);
-                    self.events.putBack(self.io, .{ .text_input_preedit_changed = std.mem.sliceTo(&self.text_input_buf, 0) }) catch {
+                    self.events.putBack(.{ .text_input_preedit_changed = std.mem.sliceTo(&self.text_input_buf, 0) }) catch {
                         log.warn("Event queue full, a text input event missed", .{});
                     };
                 },
                 c.XKB_COMPOSE_CANCELLED => {
-                    self.events.putBack(self.io, .{ .text_input_preedit_cancel = {} }) catch {
+                    self.events.putBack(.{ .text_input_preedit_cancel = {} }) catch {
                         log.warn("Event queue full, a text input event missed", .{});
                     };
                     self.text_input_buf = .{0} ** text_input_buf_len;
@@ -931,7 +971,7 @@ pub fn wlKeyboardKey(
                 unsetTextInputTimer(self);
             }
             _ = c.xkb_state_update_key(self.xkb_state, evdev_key + 8, c.XKB_KEY_UP);
-            self.events.putBack(self.io, .{
+            self.events.putBack(.{
                 .keyboard_key_up = .{
                     .key = key,
                     .modifiers = modifiers,
@@ -941,7 +981,7 @@ pub fn wlKeyboardKey(
             }) catch {
                 log.warn("Event Queue is full, key up event missed", .{});
             };
-            self.keyboard_self[@intFromEnum(key)] = false;
+            self.keyboard_state[@intFromEnum(key)] = false;
 
             if (!self.text_input_enabled) return;
         },
@@ -950,40 +990,12 @@ pub fn wlKeyboardKey(
 }
 
 fn setTextInputTimer(self: *Self) void {
-    if (self.keyboard_repeat_future) |*future| {
-        future.cancel(self.io) catch {};
-    }
-    self.keyboard_repeat_future = self.io.concurrent(keyRepeat, .{self}) catch unreachable;
+    self.keyboard_repeat_last_tick = std.Io.Clock.now(.awake, self.io);
+    self.keyboard_repeat_state = .delay;
 }
 
 fn unsetTextInputTimer(self: *Self) void {
-    if (self.keyboard_repeat_future) |*future| {
-        future.cancel(self.io) catch {};
-        self.keyboard_repeat_future = null;
-    }
-}
-
-fn keyRepeat(self: *Self) std.Io.Cancelable!void {
-    const delay_ns = self.keyboard_repeat_delay * std.time.ns_per_ms;
-    const interval_ns = std.time.ns_per_s / self.keyboard_repeat_rate;
-
-    try std.Io.sleep(self.io, .fromNanoseconds(delay_ns), .awake);
-    while (true) : (try std.Io.sleep(self.io, .fromNanoseconds(interval_ns), .awake)) {
-        self.events.putBack(self.io, .{ .keyboard_key_down = .{
-            .key = evdev_to_key[self.keyboard_last_key],
-            .modifiers = self.getKeyboardModifiers(),
-            .raw = self.keyboard_last_key,
-            .repeat = true,
-        } }) catch log.warn("Event queue full, a key down event missed", .{});
-        if (self.text_input_enabled and self.text_input_buf[0] != 0) {
-            self.events.putBack(self.io, .{
-                .text_input_changed = std.mem.sliceTo(&self.text_input_buf, 0),
-            }) catch {
-                log.warn("Event queue full, a text input event missed", .{});
-            };
-        }
-        c.xkb_compose_state_reset(self.xkb_compose_state);
-    }
+    self.keyboard_repeat_state = .none;
 }
 
 fn makeModifiers(self: *Self) Modifiers {
@@ -1159,7 +1171,7 @@ fn wlPointerButton(
     };
     if (pointer_self == c.WL_POINTER_BUTTON_STATE_PRESSED) {
         self.pointer_self[@intFromEnum(mapped_button)] = true;
-        self.events.putBack(self.io, .{ .pointer_button_down = .{
+        self.events.putBack(.{ .pointer_button_down = .{
             .button = mapped_button,
             .raw = button,
         } }) catch {
@@ -1168,7 +1180,7 @@ fn wlPointerButton(
         return;
     }
     self.pointer_self[@intFromEnum(mapped_button)] = false;
-    self.events.putBack(self.io, .{ .pointer_button_up = .{
+    self.events.putBack(.{ .pointer_button_up = .{
         .button = mapped_button,
         .raw = button,
     } }) catch {
@@ -1194,7 +1206,7 @@ fn wlPointerFrame(data: ?*anyopaque, wl_pointer: ?*c.wl_pointer) callconv(.c) vo
     _ = wl_pointer;
     const self: *Self = @ptrCast(@alignCast(data));
     if (self.pointer_position_changed) {
-        self.events.putBack(self.io, .{ .pointer_motion = .{
+        self.events.putBack(.{ .pointer_motion = .{
             .x = self.pointer_position_x,
             .y = self.pointer_position_y,
         } }) catch {
@@ -1203,7 +1215,7 @@ fn wlPointerFrame(data: ?*anyopaque, wl_pointer: ?*c.wl_pointer) callconv(.c) vo
         self.pointer_position_changed = false;
     }
     if (self.pointer_axis_changed) {
-        self.events.putBack(self.io, .{ .pointer_wheel = .{
+        self.events.putBack(.{ .pointer_wheel = .{
             .x = self.pointer_axis_x / 120,
             .y = self.pointer_axis_y / 120,
         } }) catch {
